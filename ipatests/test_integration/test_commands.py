@@ -801,7 +801,6 @@ class TestIPACommand(IntegrationTest):
         assert is_tls_version_enabled('tls1_2')
         assert is_tls_version_enabled('tls1_3')
 
-    @pytest.mark.skip(reason='https://pagure.io/freeipa/issue/8151')
     def test_sss_ssh_authorizedkeys(self):
         """Login via Ssh using private-key for ipa-user should work.
 
@@ -832,7 +831,7 @@ class TestIPACommand(IntegrationTest):
         sssd_p11_child = '/usr/libexec/sssd/p11_child'
         backup = tasks.FileBackup(self.master, sssd_p11_child)
         try:
-            content = '#!/bin/bash\nsleep 999999'
+            content = '#!/bin/bash\nsleep 60'
             # added sleep to simulate the timeout for p11_child
             self.master.put_file_contents(sssd_p11_child, content)
             self.master.run_command(
