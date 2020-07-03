@@ -471,15 +471,50 @@ class TestSSSDWithAdTrust(IntegrationTest):
             "--matchrule='<ISSUER>{}'".format(cert_subject),
             "--domain={}".format(self.master.domain.name)
         ])
+        try:
+            tasks.clear_sssd_cache(self.master)
+            # verify the user can be retrieved after the certmaprule is added
+            second_res = self.master.run_command(
+                ['id', self.users['ad']['name']])
+            assert first_res.stdout_text == second_res.stdout_text
+            verify_in_stdout = ['gid', 'uid', 'groups',
+                                self.users['ad']['name']]
+            for text in verify_in_stdout:
+                assert text in second_res.stdout_text
+        finally:
+            self.master.run_command(
+                ['ipa', 'certmaprule-del', "'{}'".format(cert_subject)])
+
+    @contextmanager
+    def override_gid_setup(self, gid):
+        sssd_conf_backup = tasks.FileBackup(self.master, paths.SSSD_CONF)
+        try:
+            with tasks.remote_sssd_config(self.master) as sssd_conf:
+                sssd_conf.edit_domain(self.master.domain,
+                                      'override_gid', gid)
+            tasks.clear_sssd_cache(self.master)
+            yield
+        finally:
+            sssd_conf_backup.restore()
+            tasks.clear_sssd_cache(self.master)
+
+    def test_override_gid_subdomain(self):
+        """Test that override_gid is working for subdomain
+
+        This is a regression test for sssd bug:
+        https://pagure.io/SSSD/sssd/issue/4061
+        """
         tasks.clear_sssd_cache(self.master)
-
-        # verify the user can be retrieved after the certmaprule is added
-        second_res = self.master.run_command(['id', self.users['ad']['name']])
-
-        assert first_res.stdout_text == second_res.stdout_text
-        verify_in_stdout = ['gid', 'uid', 'groups', self.users['ad']['name']]
-        for text in verify_in_stdout:
-            assert text in second_res.stdout_text
+        user = self.users['child_ad']['name']
+        gid = 10264
+        # verify the user can be retrieved initially
+        self.master.run_command(['id', user])
+        with self.override_gid_setup(gid):
+            test_gid = self.master.run_command(['id', user])
+            sssd_version = tasks.get_sssd_version(self.master)
+            with xfail_context(sssd_version < tasks.parse_version('2.3.0'),
+                               'https://pagure.io/SSSD/sssd/issue/4061'):
+                assert 'gid={id}'.format(id=gid) in test_gid.stdout_text
 
 
 class TestNestedMembers(IntegrationTest):
