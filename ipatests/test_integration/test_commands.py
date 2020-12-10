@@ -1395,7 +1395,7 @@ class TestIPACommand(IntegrationTest):
 
         tasks.kinit_admin(self.master)
         tasks.user_add(self.master, restricted_user,
-                       extra_args=["--shell", "/sbin/nologin"],
+                       extra_args=["--shell", "/bin/false"],
                        password=password)
         tasks.user_add(self.master, regular_user,
                        password=password)
