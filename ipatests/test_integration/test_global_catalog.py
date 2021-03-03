@@ -17,6 +17,7 @@ from ipaplatform.paths import paths
 from ipatests.pytest_ipa.integration import tasks
 from ipatests.pytest_ipa.integration import windows_tasks
 from ipatests.test_integration.base import IntegrationTest
+from ipatests.test_integration.test_caless import CALessBase
 from ipatests.pytest_ipa.integration.firewall import Firewall
 from ipatests.util import skipl_context, wait_for
 
@@ -1045,3 +1046,26 @@ class TestGlobalCatalogInstallation(IntegrationTest):
             expected = self.get_login_string_for_login_test(
                 'down-level', 'lower', 'lower', True)
             assert res.stdout_text.strip() == expected
+
+    def test_gc_track_cert(self):
+        """with IPA CA signed certs, check that the GC cert is
+        tracked and renewed by certmonger"""
+        assert is_service_active(self.master, gc_dirsrv_service)
+
+    def test_gc_certinstall(self):
+        """check the "ipa-server-certinstall --gcsrv"
+        command to install a GC cert"""
+        self.master.run_command(['ipa', 'getcert-list'])
+
+    def test_gc_external_certinstall(self):
+        """check ipa-adtrust-install --gc-cert-file to
+        configure GC with an externally-signed cert"""
+        # Sign CA, transport it to the host and get ipa and root ca paths.
+        root_ca_name = 'root_ca.crt'
+        ipa_ca_name = 'ipa_ca.crt'
+        root_ca_fname, ipa_ca_fname = tasks.sign_ca_and_transport(
+            self.master, paths.ROOT_IPA_CSR, root_ca_name, ipa_ca_name)
+        res = self.master.run_command(['ipa-adtrust-install', '-U', '-a',
+                                       self.master.config.admin_password,
+                                       '--add-sids', '--gc-cert-file',
+                                       root_ca_name, ipa_ca_name])
