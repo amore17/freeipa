@@ -151,24 +151,24 @@ parametrize_login_formats = pytest.mark.parametrize(
     pytest.param('upn', 'lower', 'mixed', False, id='user@Ipa.Test'),
 
     pytest.param('upn', 'lower', 'lower', True, id='user@ipa',
-                 marks=pytest.mark.xfail(reason='https://github.com/abbra/freeipa/issues/65', strict=True)),
+                 marks=pytest.mark.skip(reason='https://github.com/abbra/freeipa/issues/65', strict=True)),
     pytest.param('upn', 'lower', 'upper', True, id='user@IPA',
-                 marks=pytest.mark.xfail(reason='https://github.com/abbra/freeipa/issues/65', strict=True)),
+                 marks=pytest.mark.skip(reason='https://github.com/abbra/freeipa/issues/65', strict=True)),
     pytest.param('upn', 'lower', 'mixed', True, id='user@Ipa',
-                 marks=pytest.mark.xfail(reason='https://github.com/abbra/freeipa/issues/65', strict=True)),
+                 marks=pytest.mark.skip(reason='https://github.com/abbra/freeipa/issues/65', strict=True)),
 
     pytest.param('down-level', 'lower', 'lower', False, id='ipa.test\\user',
-                 marks=pytest.mark.xfail(reason='https://github.com/abbra/freeipa/issues/65', strict=True)),
+                 marks=pytest.mark.skip(reason='https://github.com/abbra/freeipa/issues/65', strict=True)),
     pytest.param('down-level', 'lower', 'upper', False, id='IPA.TEST\\user'),
     pytest.param('down-level', 'lower', 'mixed', False, id='Ipa.Test\\user',
-                 marks=pytest.mark.xfail(reason='https://github.com/abbra/freeipa/issues/65', strict=True)),
+                 marks=pytest.mark.skip(reason='https://github.com/abbra/freeipa/issues/65', strict=True)),
 
     pytest.param('down-level', 'lower', 'lower', True, id='ipa\\user',
-                 marks=pytest.mark.xfail(reason='https://github.com/abbra/freeipa/issues/65', strict=True)),
+                 marks=pytest.mark.skip(reason='https://github.com/abbra/freeipa/issues/65', strict=True)),
     pytest.param('down-level', 'lower', 'upper', True, id='IPA\\user',
-                 marks=pytest.mark.xfail(reason='https://github.com/abbra/freeipa/issues/65', strict=True)),
+                 marks=pytest.mark.skip(reason='https://github.com/abbra/freeipa/issues/65', strict=True)),
     pytest.param('down-level', 'lower', 'mixed', True, id='Ipa\\user',
-                 marks=pytest.mark.xfail(reason='https://github.com/abbra/freeipa/issues/65', strict=True)),
+                 marks=pytest.mark.skip(reason='https://github.com/abbra/freeipa/issues/65', strict=True)),
 
     pytest.param('upn', 'upper', 'lower', False, id='USER@ipa.test'),
     pytest.param('upn', 'mixed', 'lower', False, id='User@ipa.test'),
@@ -919,16 +919,16 @@ class TestGlobalCatalogInstallation(IntegrationTest):
         ['user_case', 'domain_case', 'domain_abbreviated'], [
 
         pytest.param('lower', 'lower', False, id='user, ipa.test',
-                     marks=pytest.mark.xfail(reason='https://github.com/abbra/freeipa/issues/65', strict=True)),
+                     marks=pytest.mark.skip(reason='https://github.com/abbra/freeipa/issues/65', strict=True)),
         pytest.param('lower', 'upper', False, id='user, IPA.TEST'),
         pytest.param('lower', 'mixed', False, id='user, Ipa.Test',
-                     marks=pytest.mark.xfail(reason='https://github.com/abbra/freeipa/issues/65', strict=True)),
+                     marks=pytest.mark.skip(reason='https://github.com/abbra/freeipa/issues/65', strict=True)),
         pytest.param('lower', 'lower', True, id='user, ipa',
-                     marks=pytest.mark.xfail(reason='https://github.com/abbra/freeipa/issues/65', strict=True)),
+                     marks=pytest.mark.skip(reason='https://github.com/abbra/freeipa/issues/65', strict=True)),
         pytest.param('lower', 'upper', True, id='user, IPA',
-                     marks=pytest.mark.xfail(reason='https://github.com/abbra/freeipa/issues/65', strict=True)),
+                     marks=pytest.mark.skip(reason='https://github.com/abbra/freeipa/issues/65', strict=True)),
         pytest.param('lower', 'mixed', True, id='user, Ipa',
-                     marks=pytest.mark.xfail(reason='https://github.com/abbra/freeipa/issues/65', strict=True)),
+                     marks=pytest.mark.skip(reason='https://github.com/abbra/freeipa/issues/65', strict=True)),
         pytest.param('upper', 'upper', False, id='USER, IPA.TEST'),
         pytest.param('mixed', 'upper', False, id='User, IPA.TEST'),
     ])
@@ -970,11 +970,11 @@ class TestGlobalCatalogInstallation(IntegrationTest):
         pytest.param('upn', 'lower', 'upper', False, id='user@IPA.TEST'),
         pytest.param('upn', 'lower', 'mixed', False, id='user@Ipa.Test'),
 
-        pytest.param('upn', 'lower', 'lower', True, id='user@ipa', marks=pytest.mark.xfail(
+        pytest.param('upn', 'lower', 'lower', True, id='user@ipa', marks=pytest.mark.skip(
             reason='https://gitlab.com/samba-team/samba/-/merge_requests/1677', strict=True)),
-        pytest.param('upn', 'lower', 'upper', True, id='user@IPA', marks=pytest.mark.xfail(
+        pytest.param('upn', 'lower', 'upper', True, id='user@IPA', marks=pytest.mark.skip(
             reason='https://gitlab.com/samba-team/samba/-/merge_requests/1677', strict=True)),
-        pytest.param('upn', 'lower', 'mixed', True, id='user@Ipa', marks=pytest.mark.xfail(
+        pytest.param('upn', 'lower', 'mixed', True, id='user@Ipa', marks=pytest.mark.skip(
             reason='https://gitlab.com/samba-team/samba/-/merge_requests/1677', strict=True)),
 
         pytest.param('down-level', 'lower', 'lower', False, id='ipa.test\\user'),
