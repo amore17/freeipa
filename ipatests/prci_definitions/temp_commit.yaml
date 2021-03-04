@@ -62,10 +62,24 @@ jobs:
         git_refspec: '{git_refspec}'
         template: &ci-master-latest
           name: freeipa/ci-master-f32
-          version: 0.0.13
+          version: 0.0.17
         timeout: 1800
         topology: *build
 
+#  fedora-latest/test_global_catalog_ca_less:
+#    requires: [fedora-latest/build]
+#    priority: 50
+#    job:
+#      class: RunADTests
+#      args:
+#        build_url: '{fedora-latest/build_url}'
+#        test_suite: test_integration/test_global_catalog.py::TestServerCALessGlobalCatalog
+#        topology: *master_1repl
+#        template: *ci-master-latest
+#        timeout: 12000
+#        update_packages: True
+#        post_setup_script: "dnf copr enable -y abbra/gc-wip && dnf update -y --nogpgcheck --exclude=freeipa-*,python*-ipa*"
+#
   fedora-latest/test_global_catalog:
     requires: [fedora-latest/build]
     priority: 50
@@ -73,9 +87,11 @@ jobs:
       class: RunADTests
       args:
         build_url: '{fedora-latest/build_url}'
-        test_suite: test_integration/test_global_catalog.py
+#        test_suite: test_integration/test_global_catalog.py::TestServerCALessGlobalCatalog
+#        topology: *master_1repl
+        test_suite: test_integration/test_global_catalog.py::TestGlobalCatalogInstallation::test_adtrust_install
+        topology: *adroot_adroot-client_master_replica_client
         template: *ci-master-latest
         timeout: 20000
-        topology: *adroot_adroot-client_master_replica_client
         update_packages: True
         post_setup_script: "dnf copr enable -y abbra/gc-wip && dnf update -y --nogpgcheck --exclude=freeipa-*,python*-ipa*"
