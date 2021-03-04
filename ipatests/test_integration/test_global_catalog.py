@@ -12,11 +12,14 @@ import json
 import winrm
 import string
 import random
+import functools
+import os
 
 from ipaplatform.paths import paths
 from ipatests.pytest_ipa.integration import tasks
 from ipatests.pytest_ipa.integration import windows_tasks
 from ipatests.test_integration.base import IntegrationTest
+from ipatests.test_integration.test_caless import CALessBase, ipa_certs_cleanup
 from ipatests.pytest_ipa.integration.firewall import Firewall
 from ipatests.util import xfail_context, wait_for
 
@@ -1045,3 +1048,31 @@ class TestGlobalCatalogInstallation(IntegrationTest):
             expected = self.get_login_string_for_login_test(
                 'down-level', 'lower', 'lower', True)
             assert res.stdout_text.strip() == expected
+
+
+class TestServerCALessGlobalCatalog(CALessBase):
+    """Test server caless scenario with glbal catalog using --gc-cert-file"""
+    num_replicas = 0
+
+    @classmethod
+    def install(cls, mh):
+        pass
+
+    def test_install_caless_gccert_file(self):
+        """Install CA-less server with global catalog certfile"""
+        self.create_pkcs12('ca1/server', filename='http.p12')
+        self.create_pkcs12('ca1/server', filename='dirsrv.p12')
+        self.create_pkcs12('ca1/server', filename='gc.p12')
+        self.prepare_cacert('ca1')
+
+        result = self.install_server(http_pkcs12='http.p12',
+                                     dirsrv_pkcs12='dirsrv.p12',
+                                     setup_adtrust=True,
+                                     gc_pkcs12_exists=True,
+                                     gc_pkcs12='gc.p12')
+
+        assert result.returncode == 0
+        for service in ['dirsrv@GLOBAL-CATALOG.service', 'ipa-gcsyncd.service']:
+            res = self.master.run_command(['systemctl', 'is-active', service],
+                                          ok_returncode=[0, 3])
+            assert res.returncode == 0

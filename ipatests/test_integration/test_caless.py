@@ -172,7 +172,9 @@ class CALessBase(IntegrationTest):
                        http_pkcs12_exists=True, dirsrv_pkcs12_exists=True,
                        http_pin=_DEFAULT, dirsrv_pin=_DEFAULT, pkinit_pin=None,
                        root_ca_file='root.pem', pkinit_pkcs12_exists=False,
-                       pkinit_pkcs12='server-kdc.p12', unattended=True,
+                       pkinit_pkcs12='server-kdc.p12', gc_pin=_DEFAULT,
+                       gc_pkcs12_exists=False, gc_pkcs12='server-gc.p12',
+                       setup_adtrust=False, unattended=True,
                        stdin_text=None, extra_args=None):
         """Install a CA-less server
 
@@ -200,12 +202,19 @@ class CALessBase(IntegrationTest):
             dirsrv_pin = cls.cert_password
         if pkinit_pin is _DEFAULT:
             pkinit_pin = cls.cert_password
+        if gc_pin is _DEFAULT:
+            gc_pin = cls.cert_password
         tasks.prepare_host(host)
         files_to_copy = ['root.pem']
         if http_pkcs12_exists:
             files_to_copy.append(http_pkcs12)
         if dirsrv_pkcs12_exists:
             files_to_copy.append(dirsrv_pkcs12)
+        if gc_pkcs12_exists and gc_pin:
+            files_to_copy.append(gc_pkcs12)
+            extra_args.extend(
+                ['--gc-cert-file', destname(gc_pkcs12), '--gc-pin', gc_pin]
+            )
         if pkinit_pkcs12_exists:
             files_to_copy.append(pkinit_pkcs12)
             extra_args.extend(
@@ -227,7 +236,8 @@ class CALessBase(IntegrationTest):
             extra_args.extend(['--dirsrv-pin', dirsrv_pin])
         if pkinit_pin is not None:
             extra_args.extend(['--pkinit-pin', dirsrv_pin])
-        return tasks.install_master(host, extra_args=extra_args,
+        return tasks.install_master(host, setup_adtrust=setup_adtrust,
+                                    extra_args=extra_args,
                                     unattended=unattended,
                                     stdin_text=stdin_text,
                                     raiseonerr=False)
