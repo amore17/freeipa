@@ -19,7 +19,7 @@ from ipaplatform.paths import paths
 from ipatests.pytest_ipa.integration import tasks
 from ipatests.pytest_ipa.integration import windows_tasks
 from ipatests.test_integration.base import IntegrationTest
-from ipatests.test_integration.test_caless import CALessBase, ipa_certs_cleanup
+from ipatests.test_integration.test_caless import CALessBase, TestCertInstall
 from ipatests.pytest_ipa.integration.firewall import Firewall
 from ipatests.util import xfail_context, wait_for
 
@@ -29,6 +29,8 @@ gc_dirsrv_service = 'dirsrv@GLOBAL-CATALOG.service'
 gcsyncd_service = 'ipa-gcsyncd.service'
 LOG_MESSAGE_GC_INITIALIZED = \
     'Initial LDAP dump is done, now synchronizing with GC'
+_DEFAULT = object()
+
 
 def is_service_active(host, service):
     res = host.run_command(['systemctl', 'is-active', service],
@@ -1051,12 +1053,24 @@ class TestGlobalCatalogInstallation(IntegrationTest):
 
 
 class TestServerCALessGlobalCatalog(CALessBase):
-    """Test server caless scenario with glbal catalog using --gc-cert-file"""
+    """Test server caless scenario with glbal catalog"""
     num_replicas = 0
 
-    @classmethod
-    def install(cls, mh):
-        pass
+    def certinstall(self, mode, cert_nick=None,
+                    filename='server.p12', pin=_DEFAULT, stdin_text=None,
+                    p12_pin=None):
+        if cert_nick:
+            self.create_pkcs12(cert_nick, password=p12_pin, filename=filename)
+        if pin is _DEFAULT:
+            pin = self.cert_password
+        self.copy_cert(self.master, filename)
+        args = ['ipa-server-certinstall', '-p', self.master.config.dirman_password,
+                '-%s' % mode, filename]
+        if pin is not None:
+            args += ['--pin', pin]
+        return self.master.run_command(args,
+                                       raiseonerr=False,
+                                       stdin_text=stdin_text)
 
     def test_install_caless_gccert_file(self):
         """Install CA-less server with global catalog certfile"""
@@ -1073,6 +1087,45 @@ class TestServerCALessGlobalCatalog(CALessBase):
 
         assert result.returncode == 0
         for service in ['dirsrv@GLOBAL-CATALOG.service', 'ipa-gcsyncd.service']:
-            res = self.master.run_command(['systemctl', 'is-active', service],
-                                          ok_returncode=[0, 3])
-            assert res.returncode == 0
+            self.master.run_command(['systemctl', 'is-active', service])
+
+    def test_valid_gcsrv(self):
+        "Install new valid Global Catalog certificate"
+
+        result = self.certinstall('g', 'ca1/server')
+        assert result.returncode == 0
+
+    def test_wildcard_gcsrv(self):
+        "Install new wildcard Global Catalog certificate"
+
+        result = self.certinstall('g', 'ca1/wildcard')
+        assert result.returncode == 0
+
+    def test_interactive_missing_gcsrv_pkcs_password(self):
+        "Install new Global Catalog certificate with missing PKCS#12 password"
+
+        result = self.certinstall('g', 'ca1/server',
+                                  pin=None,
+                                  stdin_text=self.cert_password + '\n')
+        assert result.returncode == 0
+
+    def test_no_gcsrv_password(self):
+        "Install new Global Catalog certificate with no PKCS#12 password"
+
+        result = self.certinstall('g', 'ca1/server', pin='', p12_pin='')
+        assert result.returncode == 0
+
+    def test_gc_dns_records(self):
+
+        expected = '0 100 3268 {}.'.format(self.master.hostname)
+        gc_records = [
+            '_ldap._tcp.Default-First-Site-Name._sites.gc._msdcs',
+            '_ldap._tcp.gc._msdcs',
+            '_gc._tcp.Default-First-Site-Name._sites',
+            '_gc._tcp',
+        ]
+        for record in gc_records:
+            res = self.master.run_command([
+                'dig', '{}.{}'.format(record, self.master.domain.name),
+                '+short', 'SRV'])
+            assert expected == res.stdout_text.strip()
