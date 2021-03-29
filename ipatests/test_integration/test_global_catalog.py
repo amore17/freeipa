@@ -289,21 +289,23 @@ class TestGlobalCatalogInstallation(IntegrationTest):
         self.master.run_command(['ipa', 'group-add-member', group2,
                                  '--groups', group1])
 
-    def test_adtrust_install(self):
-        Firewall(self.master).enable_service("freeipa-trust")
-        assert not is_service_active(self.master, gc_dirsrv_service)
-        assert not is_service_active(self.master, gcsyncd_service)
-        self.master.run_command(['systemctl', 'is-active', gcsyncd_service],
-                                ok_returncode=3)
+    @pytest.mark.parametrize('host', ['master', 'replica'])
+    def test_adtrust_install(self, host):
+        host = getattr(self, host)
+        Firewall(host).enable_service("freeipa-trust")
+        assert not is_service_active(host, gc_dirsrv_service)
+        assert not is_service_active(host, gcsyncd_service)
+        host.run_command(['systemctl', 'is-active', gcsyncd_service],
+                         ok_returncode=3)
 
-        with log_tail(self.master, paths.GCSYNCD_LOG) as get_log_tail:
-            res = self.master.run_command(['ipa-adtrust-install', '-U', '-a',
-                                           self.master.config.admin_password,
-                                           '--add-sids'])
+        with log_tail(host, paths.GCSYNCD_LOG) as get_log_tail:
+            res = host.run_command(['ipa-adtrust-install', '-U', '-a',
+                                    self.master.config.admin_password,
+                                    '--add-sids'])
             assert re.search('ports are open.+TCP Ports.+3268: msft-gc.+UDP Ports',
                             res.stdout_text, re.DOTALL)
-            assert is_service_active(self.master, gc_dirsrv_service)
-            assert is_service_active(self.master, gcsyncd_service)
+            assert is_service_active(host, gc_dirsrv_service)
+            assert is_service_active(host, gcsyncd_service)
 
             assert wait_for(
                 lambda: LOG_MESSAGE_GC_INITIALIZED  in get_log_tail(), 30)
