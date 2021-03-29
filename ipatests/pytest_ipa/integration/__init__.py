@@ -82,7 +82,9 @@ CLASS_LOGFILES = [
     paths.HOSTS,
     # IPA renewal lock
     paths.IPA_RENEWAL_LOCK,
-    paths.LETS_ENCRYPT_LOG
+    paths.LETS_ENCRYPT_LOG,
+    # global catalog sync daemon logs
+    paths.GCSYNCD_LOG,
 ]
 
 
@@ -375,7 +377,7 @@ def mh(request, class_integration_logs):
     for _i in range(cls.num_ad_domains):
         domain_descriptions.append({
             'type': 'AD',
-            'hosts': {'ad': 1}
+            'hosts': {'ad': 1, 'client': cls.num_ad_root_clients}
         })
     for _i in range(cls.num_ad_subdomains):
         domain_descriptions.append({

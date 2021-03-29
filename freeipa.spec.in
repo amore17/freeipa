@@ -831,6 +831,7 @@ Requires: tar
 Requires: xz
 Requires: openssh-clients
 Requires: sshpass
+Requires: python3-winrm
 
 %description -n python3-ipatests
 IPA is an integrated solution to provide centrally managed Identity (users,

@@ -451,6 +451,7 @@ class BasePathNamespace:
     TDBTOOL = '/usr/bin/tdbtool'
     SECRETS_TDB = '/var/lib/samba/private/secrets.tdb'
     LETS_ENCRYPT_LOG = '/var/log/letsencrypt/letsencrypt.log'
+    GCSYNCD_LOG = '/var/log/ipa/globalcatalog.log'
 
     def check_paths(self):
         """Check paths for missing files

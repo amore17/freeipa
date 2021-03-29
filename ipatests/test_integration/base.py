@@ -28,13 +28,14 @@ from pytest_sourceorder import ordered
 
 @ordered
 @pytest.mark.usefixtures('mh')
-@pytest.mark.usefixtures('integration_logs')
+# @pytest.mark.usefixtures('integration_logs')
 class IntegrationTest:
     num_replicas = 0
     num_clients = 0
     num_ad_domains = 0
     num_ad_subdomains = 0
     num_ad_treedomains = 0
+    num_ad_root_clients = 0
     required_extra_roles = []
     topology = None
     domain_level = None
