@@ -38,8 +38,6 @@ class BaseTestTrust(IntegrationTest):
     num_clients = 1
     topology = 'line'
     num_ad_domains = 1
-    num_ad_subdomains = 1
-    num_ad_treedomains = 1
 
     upn_suffix = 'UPNsuffix.com'
     upn_username = 'upnuser'
@@ -61,11 +59,6 @@ class BaseTestTrust(IntegrationTest):
         tasks.install_adtrust(cls.master)
         cls.check_sid_generation()
         tasks.sync_time(cls.master, cls.ad)
-
-        cls.child_ad = cls.ad_subdomains[0]
-        cls.ad_subdomain = cls.child_ad.domain.name
-        cls.tree_ad = cls.ad_treedomains[0]
-        cls.ad_treedomain = cls.tree_ad.domain.name
 
         # values used in workaround for
         # https://bugzilla.redhat.com/show_bug.cgi?id=1711958
