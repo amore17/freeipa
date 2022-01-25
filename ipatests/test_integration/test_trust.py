@@ -15,6 +15,7 @@ from ipaplatform.paths import paths
 from ipatests.test_integration.base import IntegrationTest
 from ipatests.pytest_ipa.integration import tasks
 from ipatests.pytest_ipa.integration import fips
+from ipatests.util import xfail_context
 from ipapython.dn import DN
 from collections import namedtuple
 from contextlib import contextmanager
@@ -1084,6 +1085,12 @@ class TestNonPosixAutoPrivateGroup(BaseTestTrust):
             self.mod_idrange_auto_private_group(type)
             (uid, gid) = self.get_user_id(self.master, nonposixuser)
             assert(uid == test_uid and gid == test_gid)
+        result = self.clients[0].run_command(
+            ['id', nonposixuser], raiseonerr=False)
+        with xfail_context(
+                (result.returncode > 0),
+                reason='https://bugzilla.redhat.com/show_bug.cgi?id=2010512'):
+            tasks.assert_error(result, "no such user")
 
     @pytest.mark.parametrize('type', ['hybrid', 'true', "false"])
     def test_nonposixuser_nondefault_primary_group(self, type):
