@@ -69,6 +69,8 @@ class Config(pytest_multihost.config.Config):
         if self.domain_level is None:
             self.domain_level = MAX_DOMAIN_LEVEL
         self.fips_mode = kwargs.get('fips_mode', False)
+        self.github_user_name = kwargs.get('github_user_name') or 'amoreidp'
+        self.github_user_password = kwargs.get('github_user_password') or 'Secret123'
 
     def get_domain_class(self):
         return Domain
