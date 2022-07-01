@@ -103,6 +103,9 @@ def setup_keycloakserver(host, version='17.0.0'):
     host.run_command(
         ['su', '-', 'keycloak', '-c', '/opt/keycloak/bin/kc.sh build'])
     host.run_command(["systemctl", "start", "keycloak"])
+    time.sleep(60)
+    status = host.run_command(["systemctl", "status", "keycloak"])
+    assert "running" in status.stdout_text
     host.run_command(["/opt/keycloak/bin/kc.sh", "show-config"])
 
     # Setup keycloak for use:
@@ -116,7 +119,7 @@ def setup_keycloakserver(host, version='17.0.0'):
                "--password", password
                ]
     tasks.run_repeatedly(
-        host, kcadmin, timeout=60)
+        host, kcadmin, timeout=600)
     host.run_command(
         [kcadmin_sh, "create", "users", "-r", "master",
          "-s", "username=testuser1", "-s", "enabled=true",
