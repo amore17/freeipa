@@ -1,0 +1,11 @@
+# Configuration for Schema compatibility refresh task for
+# Master installation. For different reasons, the compat
+# tree maps might get corrupted and some entries would be
+# missing. This adds the container on tree that exposes the
+# feature able to rebuild online the whole compat tree on
+# demand via a DS task.
+
+dn: cn=Schema compatibility refresh task,cn=tasks,cn=config
+default:objectClass: top
+default:objectClass: extensibleObject
+default:cn: Schema compatibility refresh task
