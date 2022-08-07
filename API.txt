@@ -1074,6 +1074,12 @@ command: compat_is_enabled/1
 args: 0,1,1
 option: Str('version?')
 output: Output('result')
+command: compat_tree_rebuild/1
+args: 0,1,3
+option: Flag('no_wait?', autofill=True, default=False)
+output: Entry('result')
+output: Output('summary', type=[<type 'unicode'>, <type 'NoneType'>])
+output: PrimaryKey('value')
 command: config_mod/1
 args: 0,32,3
 option: Flag('add_sids?', autofill=True, default=False)
@@ -6958,6 +6964,7 @@ default: command_defaults/1
 default: command_find/1
 default: command_show/1
 default: compat_is_enabled/1
+default: compat_tree_rebuild/1
 default: config/1
 default: config_mod/1
 default: config_show/1
