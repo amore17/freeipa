@@ -1554,6 +1554,39 @@ class TestIPACommand(IntegrationTest):
 
         assert 'Discovered server %s' % self.master.hostname in result
 
+    def test_ipa_compat_tree_rebuild(self):
+        """Test ipa compat-tree-rebuild for slapi-nis plugin..
+
+        Test for : https://pagure.io/freeipa/issue/9219
+
+        Test to verify that there is no need to restart the
+        LDAP server to rebuilt the compat tree.
+        """
+        hostgroup = 'testhostgroup'
+        base_dn = str(self.master.domain.basedn)
+        text = "dn: cn={0},cn=ng,cn=compat,{1}".format(hostgroup, base_dn)
+        tasks.kdestroy_all(self.master)
+        tasks.kinit_admin(self.master)
+        self.master.run_command(['ipa', 'hostgroup-add',
+                                 hostgroup])
+        self.master.run_command(['ipa', 'hostgroup-del',
+                                 hostgroup])
+        base = "cn=compat,{basedn}".format(basedn=base_dn)
+        result1 = tasks.ldapsearch_dm(
+            self.master,
+            base=base,
+            ldap_args=["(&(objectClass=nisNetgroup)(cn=testhostgroup))"]
+        )
+        assert text in result1.stdout_text
+        refresh = self.master.run_command(['ipa', 'compat-tree-rebuild'])
+        assert "Refresh maps task finished" in refresh.stdout_text
+        result2 = tasks.ldapsearch_dm(
+            self.master,
+            base=base,
+            ldap_args=["(&(objectClass=nisNetgroup)(cn=testhostgroup))"]
+        )
+        assert text not in result2.stdout_text
+
 
 class TestIPACommandWithoutReplica(IntegrationTest):
     """
