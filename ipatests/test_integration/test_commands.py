@@ -1554,6 +1554,21 @@ class TestIPACommand(IntegrationTest):
 
         assert 'Discovered server %s' % self.master.hostname in result
 
+    def test_ipa_compat_tree_rebuild(self):
+        """
+        Exercise the slapi-nis compat tree rebuild
+        """
+        testgroup = "hostgroup"
+        tasks.kdestroy_all(self.master)
+        tasks.kinit_admin(self.master)
+        self.master.run_command(["ipa", "hostgroup-add", testgroup])
+        base_dn = str(self.master.domain.basedn)
+        base = "cn=compat,{basedn}".format(basedn=base_dn)
+        extra_attr = "(&(objectClass=nisNetgroup)(cn={0}))".format(testgroup)
+        search = tasks.ldapsearch_dm(self.master, base,
+                                     ldap_args=[extra_attr, "dn"], scope='sub')
+        assert "cn={0}".format(testgroup) in search.stdout_text
+
 
 class TestIPACommandWithoutReplica(IntegrationTest):
     """
