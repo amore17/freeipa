@@ -31,6 +31,7 @@ from pytest_sourceorder import ordered
 @pytest.mark.usefixtures('integration_logs')
 class IntegrationTest:
     num_replicas = 0
+    num_servers = 0
     num_clients = 0
     num_ad_domains = 0
     num_ad_subdomains = 0
@@ -52,7 +53,7 @@ class IntegrationTest:
 
     @classmethod
     def get_all_hosts(cls):
-        return ([cls.master] + cls.replicas + cls.clients +
+        return ([cls.master] + cls.replicas + cls.clients + cls.servers +
                 [cls.host_by_role(r) for r in cls.required_extra_roles])
 
     @classmethod
