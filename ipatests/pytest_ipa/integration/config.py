@@ -94,7 +94,7 @@ class Config(pytest_multihost.config.Config):
                 yield host
 
     def get_all_ipa_hosts(self):
-        for ipa_domain in (d for d in self.domains if d.is_ipa_type):
+        for ipa_domain in (d for d in self.domains if d.is_ipa_type or d.is_trusted_ipa_type):
             for ipa_host in ipa_domain.hosts:
                 yield ipa_host
 
@@ -135,13 +135,17 @@ class Domain(pytest_multihost.config.Domain):
         self.name = str(name)
         self.hosts = []
 
-        assert self.is_ipa_type or self.is_ad_type
+        assert self.is_ipa_type or self.is_ad_type or self.is_trusted_ipa_type
         self.realm = self.name.upper()
         self.basedn = DN(*(('dc', p) for p in name.split('.')))
 
     @property
     def is_ipa_type(self):
         return self.type == 'IPA'
+
+    @property
+    def is_trusted_ipa_type(self):
+        return self.type == 'TRUSTED_IPA'
 
     @property
     def is_ad_type(self):
@@ -158,6 +162,8 @@ class Domain(pytest_multihost.config.Domain):
             return ('ad_subdomain',)
         elif self.type == 'AD_TREEDOMAIN':
             return ('ad_treedomain',)
+        elif self.type == 'TRUSTED_IPA':
+            return ('trusted_master', 'trusted_replica', 'trusted_client')
         else:
             raise LookupError(self.type)
 
@@ -168,12 +174,18 @@ class Domain(pytest_multihost.config.Domain):
             return Host
         elif self.is_ad_type:
             return WinHost
+        elif self.is_trusted_ipa_type:
+            return Host
         else:
             raise LookupError(self.type)
 
     @property
     def master(self):
         return self.host_by_role('master')
+
+    @property
+    def trusted_master(self):
+        return self.host_by_role('trusted_master')
 
     @property
     def masters(self):
@@ -184,8 +196,16 @@ class Domain(pytest_multihost.config.Domain):
         return self.hosts_by_role('replica')
 
     @property
+    def trusted_replicas(self):
+        return self.hosts_by_role('trusted_replica')
+
+    @property
     def clients(self):
         return self.hosts_by_role('client')
+
+    @property
+    def trusted_clients(self):
+        return self.hosts_by_role('trusted_client')
 
     @property
     def ads(self):
