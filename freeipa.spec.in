@@ -308,10 +308,10 @@ BuildRequires:  libpwquality-devel
 BuildRequires:  libsss_idmap-devel
 BuildRequires:  libsss_certmap-devel
 BuildRequires:  libsss_nss_idmap-devel >= %{sssd_version}
-%if 0%{?fedora} >= 41
+%if 0%{?fedora} >= 41 || 0%{?rhel} >= 10
 # Do not use nodejs22 on fedora < 41, https://pagure.io/freeipa/issue/9643
 BuildRequires: nodejs(abi)
-%elif 0%{?fedora} >= 39 || 0%{?rhel} >= 10
+%elif 0%{?fedora} >= 39
 # Do not use nodejs20 on fedora < 39, https://pagure.io/freeipa/issue/9374
 BuildRequires:  nodejs(abi) < 127
 %else
@@ -1516,6 +1516,7 @@ fi
 %{_sbindir}/ipa-pkinit-manage
 %{_sbindir}/ipa-crlgen-manage
 %{_sbindir}/ipa-cert-fix
+%{_sbindir}/ipa-idrange-fix
 %{_sbindir}/ipa-acme-manage
 %{_sbindir}/ipa-migrate
 %if 0%{?fedora} >= 38
@@ -1594,6 +1595,7 @@ fi
 %{_mandir}/man1/ipa-pkinit-manage.1*
 %{_mandir}/man1/ipa-crlgen-manage.1*
 %{_mandir}/man1/ipa-cert-fix.1*
+%{_mandir}/man1/ipa-idrange-fix.1*
 %{_mandir}/man1/ipa-acme-manage.1*
 %{_mandir}/man1/ipa-migrate.1*
 
