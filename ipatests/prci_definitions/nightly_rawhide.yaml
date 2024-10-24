@@ -1936,6 +1936,19 @@ jobs:
         timeout: 10800
         topology: *master_1repl
 
+  fedora-rawhide/test_idrange_fix:
+    requires: [fedora-rawhide/build]
+    priority: 50
+    job:
+      class: RunPytest
+      args:
+        build_url: '{fedora-rawhide/build_url}'
+        update_packages: True
+        test_suite: test_integration/test_ipa_idrange_fix.py
+        template: *ci-master-frawhide
+        timeout: 3600
+        topology: *master_1repl
+
   fedora-rawhide/test_subids:
     requires: [fedora-rawhide/build]
     priority: 50
@@ -2091,6 +2104,19 @@ jobs:
         template: *ci-master-frawhide
         timeout: 6300
         topology: *master_3repl_1client
+
+  fedora-rawhide/test_hsm_TestHSMInstallPasswordFile:
+    requires: [fedora-rawhide/build]
+    priority: 50
+    job:
+      class: RunPytest
+      args:
+        build_url: '{fedora-rawhide/build_url}'
+        update_packages: True
+        test_suite: test_integration/test_hsm.py::TestHSMInstallPasswordFile
+        template: *ci-master-frawhide
+        timeout: 6300
+        topology: *master_1repl
 
   fedora-rawhide/test_hsm_TestHSMInstallADTrustBase:
     requires: [fedora-rawhide/build]
@@ -2273,3 +2299,16 @@ jobs:
         template: *ci-master-frawhide
         timeout: 3600
         topology: *master_1repl_1client
+
+  fedora-rawhide/test_cockpit:
+    requires: [fedora-rawhide/build]
+    priority: 50
+    job:
+      class: RunPytest
+      args:
+        build_url: '{fedora-rawhide/build_url}'
+        update_packages: True
+        test_suite: test_integration/test_cockpit.py
+        template: *ci-master-frawhide
+        timeout: 3600
+        topology: *master_1repl
