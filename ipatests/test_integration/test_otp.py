@@ -796,3 +796,28 @@ class TestOTPToken(IntegrationTest):
         finally:
             master.run_command(['ipa', 'pwpolicy-mod', '--minlife', '1'])
             master.run_command(['ipa', 'user-del', USER1])
+
+    def test_totp_ldapsearch(self):
+        master = self.master
+
+        tasks.kinit_admin(self.master)
+        otpuid, totp = add_otptoken(master, USER, otptype="totp")
+        otpvalue = totp.generate(int(time.time())).decode("ascii")
+        try:
+            stdin_text = f"{PASSWORD}{otpvalue}\n"
+            basedn = self.master.domain.basedn
+            search = f"uid={USER},cn=users,cn=accounts,{basedn}"
+            args = [
+                'ldapsearch',
+                '-D', str(search),
+                '-w', stdin_text,
+            ]
+            self.master.run_command(args, raiseonerr=False)
+            dn = "uid={user},cn=users,cn=accounts,{base_dn}".format(
+                user=USER, base_dn=str(self.master.domain.basedn))
+            result = self.master.run_command(
+                ["ldapsearch", "-D", dn,
+                 "-w", stdin_text])
+            self.master.run_command(result)
+        finally:
+            del_otptoken(master, otpuid)
