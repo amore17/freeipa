@@ -1624,6 +1624,12 @@ def add_a_record(master, host):
                             host.hostname + ".",
                             '--a-rec', host.ip])
 
+def add_dnsforwardzone(host, domain, ip, policy="only"):
+    host.run_command([
+            "ipa", "dnsforwardzone-add", domain,
+            "--forwarder", ip,
+            "--forward-policy={0}".format(policy)
+        ])
 
 def resolve_record(nameserver, query, rtype="SOA", retry=True, timeout=100):
     """Resolve DNS record
