@@ -1206,109 +1206,66 @@ class TestNonPosixAutoPrivateGroup(BaseTestTrust):
                     and group in test_group.stdout_text)
 
 
-class TestPosixAutoPrivateGroup(BaseTestTrust):
-    """
-    Tests for auto-private-groups option with posix AD trust
-    Related : https://pagure.io/freeipa/issue/8807
-    """
+
+
+
+class TestHBAC(IntegrationTest):
     topology = 'line'
-    num_ad_domains = 1
     num_clients = 1
-    num_ad_subdomains = 0
-    num_ad_treedomains = 0
-    uid_override = "99999999"
-    gid_override = "78878787"
+    num_ad_domains = 1
+    ad_user_login = 'nonposixuser'
+    ad_user_password = 'Secret123'
 
-    def test_add_posix_trust(self):
-        tasks.configure_dns_for_trust(self.master, self.ad)
-        tasks.establish_trust_with_ad(
-            self.master, self.ad_domain,
-            extra_args=['--range-type', 'ipa-ad-trust-posix'])
+    @classmethod
+    def install(cls, mh):
+        tasks.install_master(cls.master)
+        tasks.install_client(cls.master, cls.clients[0])
+        cls.ad = cls.ads[0]
+        cls.ad_user = '{}@{}'.format(cls.ad_user_login, cls.ad.domain.name)
 
-    @pytest.mark.parametrize('type', ['hybrid', 'true', "false"])
-    def test_gidnumber_not_corresponding_existing_group(self, type):
-        """
-        Test checks that sssd can resolve AD users which
-        contain posix attributes (uidNumber and gidNumber)
-        but there is no group with the corresponding gidNumber.
-        """
-        posixuser = "testuser2@%s" % self.ad_domain
-        self.mod_idrange_auto_private_group(type)
-        if type != "true":
-            result = self.clients[0].run_command(['id', posixuser],
-                                                 raiseonerr=False)
-            tasks.assert_error(result, "no such user")
-        else:
-            # sssd_version = tasks.get_sssd_version(self.clients[0])
-            with xfail_context(True,
-                               'https://github.com/SSSD/sssd/issues/5988'):
-                (uid, gid) = self.get_user_id(self.clients[0], posixuser)
-                assert uid == gid
-                assert uid == '10060'
+        tasks.install_adtrust(cls.master)
+        tasks.configure_dns_for_trust(cls.master, cls.ad)
+        tasks.configure_windows_dns_for_trust(cls.ad, cls.master)
+        tasks.establish_trust_with_ad(cls.master, cls.ad.domain.name,
+                                      extra_args=['--range-type=ipa-ad-trust',
+                                                  '--two-way=true']
+                                      )
 
-    @pytest.mark.parametrize('type', ['hybrid', 'true', "false"])
-    def test_only_uid_number_auto_private_group_default(self, type):
-        """
-        Test checks that posix user with only uidNumber defined
-        and gidNumber not set, auto-private-group
-        is set to false/true/hybrid
-        """
-        posixuser = "testuser1@%s" % self.ad_domain
-        self.mod_idrange_auto_private_group(type)
-        if type == "true":
-            sssd_version = tasks.get_sssd_version(self.clients[0])
-            bad_version = (tasks.parse_version("2.8.2") <= sssd_version
-                           < tasks.parse_version("2.9.4"))
-            with xfail_context(bad_version,
-                 "https://pagure.io/freeipa/issue/9295"):
-                (uid, gid) = self.get_user_id(self.clients[0], posixuser)
-                assert uid == gid
-        else:
-            for host in [self.master, self.clients[0]]:
-                result = host.run_command(['id', posixuser], raiseonerr=False)
-                tasks.assert_error(result, "no such user")
+    @classmethod
+    def uninstall(cls, mh):
+        pass
 
-    @pytest.mark.parametrize('type', ['hybrid', 'true', "false"])
-    def test_auto_private_group_primary_group(self, type):
-        """
-        Test checks that AD users which contain posix attributes
-        (uidNumber and gidNumber) and there is primary group
-        with gid number defined.
-        """
-        posixuser = "testuser@%s" % self.ad_domain
-        self.mod_idrange_auto_private_group(type)
-        (uid, gid) = self.get_user_id(self.clients[0], posixuser)
-        test_grp = self.clients[0].run_command(["id", posixuser])
-        assert uid == '10042'
-        if type == "true":
-            assert uid == gid
-            groups = "groups=10042(testuser@{0}),10047(testgroup@{1})".format(
-                self.ad_domain, self.ad_domain)
-            assert groups in test_grp.stdout_text
-        else:
-            assert gid == '10047'
-            groups = "10047(testgroup@{0})".format(self.ad_domain)
-            assert groups in test_grp.stdout_text
+    def test_hbac(self):
+        srule = "sudorule_11"
+        tasks.clear_sssd_cache(self.master)
+        try:
+            tasks.kdestroy_all(self.master)
+            tasks.kinit_admin(self.master)
+            tasks.group_add(self.master, groupname="hbacgroup_external",
+                            extra_args=["--external"])
+            tasks.group_add(self.master, groupname="hbacgroup")
+            tasks.group_add_member(self.master, groupname="hbacgroup",
+                                   extra_args=['--groups=hbacgroup_external'])
+            self.master.run_command([
+                'ipa', '-n', 'group-add-member', '--external',
+                self.ad_user, 'hbacgroup_external'])
+            self.master.run_command(
+                ["ipa", "sudorule-add", srule, "--hostcat=all", "--cmdcat=all"])
+            self.master.run_command(
+                ["ipa", "sudorule-add-user", srule, "--groups=hbacgroup"])
+            tasks.clear_sssd_cache(self.master)
+            tasks.clear_sssd_cache(self.clients[0])
+            time.sleep(60)
+            tasks.wait_for_sssd_domain_status_online(self.master)
+            test_sudo = "su {0} -c 'sudo -S id'".format(self.ad_user)
+            with self.master.spawn_expect(test_sudo, default_timeout=100) as e:
+                e.sendline('Secret123')
+                e.expect_exit(ignore_remaining_output=True, timeout=60)
+                output = e.get_last_output()
+            assert 'uid=0(root)' in output
+        finally:
+            tasks.clear_sssd_cache(self.master)
+            # to fail test to collect green logs
+            tasks.group_add(self.master, groupname="hbacgroup_external",
+                            extra_args=["--external"])
 
-    @pytest.mark.parametrize('type', ['hybrid', 'true', "false"])
-    def test_idoverride_with_auto_private_group(self, type):
-        """
-        Override ad trusted user in default trust view
-        and set auto-private-groups=[hybrid,true,false]
-        and ensure that overridden values takes effect.
-        """
-        posixuser = "testuser@%s" % self.ad_domain
-        with self.set_idoverrideuser(posixuser,
-                                     self.uid_override,
-                                     self.gid_override):
-            self.mod_idrange_auto_private_group(type)
-            (uid, gid) = self.get_user_id(self.clients[0], posixuser)
-            assert(uid == self.uid_override
-                   and gid == self.gid_override)
-            result = self.clients[0].run_command(['id', posixuser])
-            sssd_version = tasks.get_sssd_version(self.clients[0])
-            bad_version = sssd_version >= tasks.parse_version("2.9.4")
-            with xfail_context(bad_version and type in ('false', 'hybrid'),
-                 "https://github.com/SSSD/sssd/issues/7169"):
-                assert "10047(testgroup@{0})".format(
-                    self.ad_domain) in result.stdout_text
