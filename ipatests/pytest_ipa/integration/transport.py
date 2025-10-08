@@ -44,7 +44,7 @@ class IPAOpenSSHTransport(OpenSSHTransport):
             self.log.critical("No SSH credentials configured")
             raise RuntimeError("No SSH credentials configured")
 
-        argv.append(self.host.external_hostname)
+        argv.append(self.host.hostname)
         self.log.debug("SSH invocation: %s", argv)
 
         return argv
