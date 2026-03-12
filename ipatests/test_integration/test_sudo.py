@@ -1274,6 +1274,115 @@ class TestSudo_Functional(IntegrationTest):
             "as a group name"
         ) in result.stderr_text
 
+    def test_sudo_ipa_schema_check_sudo_runasgroup_attribute_support(self):
+        """
+        Check sudo runasgroup attribute support.
+
+        IDM-IPA-TC: Sudo IPA Schema: Check sudo runasgroup attribute support
+        """
+        master = self.master
+        kinit_admin(master)
+
+        rule_name = "runasgroup_schema_rule"
+        grp1 = "runas_grp1"
+        grp2 = "runas_grp2"
+        dummygrp = "runas_dummygrp"
+        cmd = "/bin/date"
+
+        # Ensure sudo_provider=ipa for native IPA schema
+        sssd_backup = FileBackup(self.client, paths.SSSD_CONF)
+        try:
+            with remote_sssd_config(self.client) as sssd_conf:
+                sssd_conf.edit_domain(
+                    self.client.domain, 'sudo_provider', 'ipa')
+
+            # Add defaults rule for NOPASSWD
+            master.run_command(
+                ["ipa", "sudorule-add", "defaults"], raiseonerr=False)
+            master.run_command([
+                "ipa", "sudorule-add-option", "defaults",
+                "--sudooption", "!authenticate"
+            ], raiseonerr=False)
+
+            # Create groups and add members
+            for g in (grp1, grp2, dummygrp):
+                master.run_command(["ipa", "group-add", g], raiseonerr=False)
+            master.run_command(
+                ["ipa", "group-add-member", grp1, "--users", self.USER_1])
+            master.run_command(
+                ["ipa", "group-add-member", grp2, "--users", self.USER_2])
+            master.run_command(
+                ["ipa", "group-add-member", dummygrp, "--users", self.USER_3])
+
+            # Add sudo command and create rule with empty runas categories
+            master.run_command(["ipa", "sudocmd-add", cmd], raiseonerr=False)
+            master.run_command([
+                "ipa", "sudorule-add", rule_name,
+                "--usercat", "all", "--hostcat", "all", "--cmdcat", "all",
+                "--runasusercat", "", "--runasgroupcat", ""
+            ])
+            master.run_command([
+                "ipa", "sudorule-add-host", rule_name,
+                "--hosts", self.client.hostname
+            ])
+            master.run_command([
+                "ipa", "sudorule-add-allow-command",
+                f"--sudocmds={cmd}", rule_name
+            ])
+
+            # runasgroup=grp1: USER_1 cannot run as grp2
+            master.run_command([
+                "ipa", "sudorule-add-runasgroup", rule_name, "--groups", grp1
+            ])
+            clear_sssd_cache(self.client)
+            result = self.run_as_sudo_group(
+                cmd, sudo_group=grp2, su_user=self.USER_1, skip_password=True)
+            assert result.returncode != 0
+            assert "not allowed to execute" in (
+                result.stdout_text + result.stderr_text
+            )
+
+            # runasgroup=grp2: USER_1 can run as grp2
+            master.run_command([
+                "ipa", "sudorule-remove-runasgroup", rule_name, "--groups", grp1
+            ])
+            master.run_command([
+                "ipa", "sudorule-add-runasgroup", rule_name, "--groups", grp2
+            ])
+            clear_sssd_cache(self.client)
+            result = self.run_as_sudo_group(
+                cmd, sudo_group=grp2, su_user=self.USER_1, skip_password=True)
+            assert result.returncode == 0
+
+            # runasgroup=dummygrp: USER_1 cannot run as grp2
+            master.run_command([
+                "ipa", "sudorule-remove-runasgroup", rule_name, "--groups", grp2
+            ])
+            master.run_command([
+                "ipa", "sudorule-add-runasgroup", rule_name, "--groups", dummygrp
+            ])
+            clear_sssd_cache(self.client)
+            result = self.run_as_sudo_group(
+                cmd, sudo_group=grp2, su_user=self.USER_1, skip_password=True)
+            assert result.returncode != 0
+            assert "not allowed to execute" in (
+                result.stdout_text + result.stderr_text
+            )
+        finally:
+            sssd_backup.restore()
+            self.client.run_command(['systemctl', 'restart', 'sssd'])
+            kinit_admin(master)
+            master.run_command(
+                ["ipa", "sudorule-del", rule_name], raiseonerr=False)
+            master.run_command(
+                ["ipa", "sudorule-del", "defaults"], raiseonerr=False)
+            for g in (grp1, grp2, dummygrp):
+                master.run_command(
+                    ["ipa", "group-del", g], raiseonerr=False)
+            master.run_command(
+                ["ipa", "sudocmd-del", cmd], raiseonerr=False)
+            clear_sssd_cache(self.client)
+
     # ----------------------
     # Sudo disable/enable
     # ----------------------
