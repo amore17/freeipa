@@ -1314,21 +1314,13 @@ class TestSudo_Functional(IntegrationTest):
             master.run_command(
                 ["ipa", "group-add-member", dummygrp, "--users", self.USER_3])
 
-            # Add sudo command and create rule with empty runas categories
-            master.run_command(["ipa", "sudocmd-add", cmd], raiseonerr=False)
+            # Create rule with empty runas categories (cmdcat=all allows all)
             master.run_command([
                 "ipa", "sudorule-add", rule_name,
                 "--usercat", "all", "--hostcat", "all", "--cmdcat", "all",
                 "--runasusercat", "", "--runasgroupcat", ""
             ])
-            master.run_command([
-                "ipa", "sudorule-add-host", rule_name,
-                "--hosts", self.client.hostname
-            ])
-            master.run_command([
-                "ipa", "sudorule-add-allow-command",
-                f"--sudocmds={cmd}", rule_name
-            ])
+            # With hostcat=all and cmdcat=all, rule applies to all hosts/commands
 
             # runasgroup=grp1: USER_1 cannot run as grp2
             master.run_command([
@@ -1379,8 +1371,6 @@ class TestSudo_Functional(IntegrationTest):
             for g in (grp1, grp2, dummygrp):
                 master.run_command(
                     ["ipa", "group-del", g], raiseonerr=False)
-            master.run_command(
-                ["ipa", "sudocmd-del", cmd], raiseonerr=False)
             clear_sssd_cache(self.client)
 
     # ----------------------
