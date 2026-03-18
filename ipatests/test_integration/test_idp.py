@@ -315,3 +315,98 @@ class TestIDPKeycloak(IntegrationTest):
             tasks.kinit_admin(self.master)
             self.master.run_command(["rm", "-rf", backup_path])
             self.master.run_command(["ipa", "idp-del", "testidp"])
+
+
+# Provider templates that can be tested without external OAuth credentials.
+# Keycloak is tested separately in TestIDPKeycloak with full authentication.
+# Google, GitHub, Microsoft, Okta require external services - we only verify
+# that the IdP configuration is correctly created from provider templates.
+IDP_PROVIDER_CONFIGS = [
+    ('google', 'googleidp', [], {
+        'auth_uri': 'https://accounts.google.com/o/oauth2/auth',
+        'dev_auth_uri': 'https://oauth2.googleapis.com/device/code',
+        'token_uri': 'https://oauth2.googleapis.com/token',
+    }),
+    ('github', 'githubidp', [], {
+        'auth_uri': 'https://github.com/login/oauth/authorize',
+        'dev_auth_uri': 'https://github.com/login/device/code',
+        'token_uri': 'https://github.com/login/oauth/access_token',
+    }),
+    ('microsoft', 'microsoftidp', ['--org=common'], {
+        'auth_uri': 'https://login.microsoftonline.com/common/oauth2/v2.0/'
+                    'authorize',
+        'dev_auth_uri': 'https://login.microsoftonline.com/common/oauth2/'
+                        'v2.0/devicecode',
+        'token_uri': 'https://login.microsoftonline.com/common/oauth2/v2.0/'
+                     'token',
+    }),
+    ('okta', 'oktaidp', ['--base-url=okta.example.com'], {
+        'auth_uri': 'https://okta.example.com/oauth2/v1/authorize',
+        'dev_auth_uri': 'https://okta.example.com/oauth2/v1/device/authorize',
+        'token_uri': 'https://okta.example.com/oauth2/v1/token',
+    }),
+]
+
+
+class TestIDPProviderConfig(IntegrationTest):
+    """
+    Test IdP configuration for all supported provider templates.
+
+    These tests verify that each provider template (google, github, microsoft,
+    okta) correctly generates IdP configuration. Full authentication is only
+    tested with Keycloak in TestIDPKeycloak, since other providers require
+    external OAuth credentials not available in CI.
+    """
+
+    num_replicas = 0
+    topology = 'line'
+
+    @classmethod
+    def install(cls, mh):
+        tasks.install_master(cls.master, extra_args=['--no-dnssec-validation'])
+        tasks.kinit_admin(cls.master)
+        cls.master.run_command(["ipa", "config-mod", "--user-auth-type=idp",
+                                "--user-auth-type=password"])
+
+    @pytest.mark.parametrize("provider,name,extra_args,expected_endpoints",
+                            IDP_PROVIDER_CONFIGS)
+    def test_idp_provider_config(self, provider, name, extra_args,
+                                 expected_endpoints):
+        """
+        Verify that each provider template creates correct IdP configuration
+        and users can be associated with the IdP.
+        """
+        tasks.kinit_admin(self.master)
+        idp_add_cmd = ["ipa", "idp-add", name, "--provider=" + provider,
+                       "--client-id=test_client_id"]
+        idp_add_cmd.extend(extra_args)
+        self.master.run_command(idp_add_cmd, stdin_text="secret\nsecret")
+
+        try:
+            result = self.master.run_command(["ipa", "idp-show", name])
+            stdout = result.stdout_text
+            for key, expected in expected_endpoints.items():
+                assert expected in stdout, (
+                    "Expected {} in idp-show output: {}".format(expected, key)
+                )
+
+            # Verify user can be associated with this IdP
+            user_name = "{}user".format(provider)
+            idp_user_id = "user1@{}".format(provider)
+            tasks.user_add(self.master, user_name,
+                           extra_args=["--user-auth-type=idp",
+                                       "--idp-user-id=" + idp_user_id,
+                                       "--idp=" + name])
+
+            list_user = self.master.run_command(
+                ["ipa", "user-find", "--idp-user-id=" + idp_user_id])
+            assert user_name in list_user.stdout_text
+
+            list_by_idp = self.master.run_command(
+                ["ipa", "user-find", "--idp=" + name])
+            assert user_name in list_by_idp.stdout_text
+
+            # Cleanup user
+            self.master.run_command(["ipa", "user-del", user_name])
+        finally:
+            self.master.run_command(["ipa", "idp-del", name])
