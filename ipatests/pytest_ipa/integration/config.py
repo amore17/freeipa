@@ -47,6 +47,10 @@ class Config(pytest_multihost.config.Config):
         'token_name',
         'token_password',
         'token_library',
+        'azure_tenant_id',
+        'azure_admin_client_id',
+        'azure_admin_client_secret',
+        'azure_domain',
     }
 
     def __init__(self, **kwargs):
@@ -75,6 +79,12 @@ class Config(pytest_multihost.config.Config):
         self.token_name = kwargs.get('token_name', None)
         self.token_password = kwargs.get('token_password', None)
         self.token_library = kwargs.get('token_library', None)
+        self.azure_tenant_id = kwargs.get('azure_tenant_id') or None
+        self.azure_admin_client_id = kwargs.get('azure_admin_client_id') or None
+        self.azure_admin_client_secret = (
+            kwargs.get('azure_admin_client_secret') or None
+        )
+        self.azure_domain = kwargs.get('azure_domain') or None
 
     def get_domain_class(self):
         return Domain
