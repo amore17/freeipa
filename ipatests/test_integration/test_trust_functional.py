@@ -1302,8 +1302,6 @@ class TestTrustFunctionalSSH(BaseTestTrust):
             user1_upn = self._ad_principal(base1, domain, realm=True)
             user2 = self._ad_principal(base2, domain, realm=False)
 
-            # kinit as user1 directly on the client; avoids driving an
-            # interactive kinit prompt through spawn_expect.
             tasks.kdestroy_all(client)
             tasks.kinit_as_user(client, user1_upn, self.ad_user_password)
 
@@ -1433,25 +1431,20 @@ class TestTrustFunctionalSSH(BaseTestTrust):
             user1_upn = self._ad_principal(base1, domain, realm=True)
             user2 = self._ad_principal(base2, domain, realm=False)
             tasks.kdestroy_all(client)
-            # Use the UPN (uppercase realm) for kinit to ensure reliable
-            # Kerberos principal canonicalisation.
             tasks.kinit_as_user(client, user1_upn, self.ad_user_password)
-            # -t forces PTY allocation so that su can display the password
-            # prompt; without it the SSH session has no terminal and su fails
-            # with "Authentication failure".
-            with client.spawn_expect([
-                'ssh', '-t', '-o', 'StrictHostKeyChecking=no', '-K',
+
+            # SSH as user1 with GSSAPI, then su to user2.
+            # -tt forces remote PTY allocation so su can prompt for
+            # the password; the password is delivered via stdin_text
+            # through SSH into the remote PTY where su reads it.
+            # '--' stops the SSH from absorbing su's -c flag via
+            # glibc getopt argument permutation.
+            result = client.run_command([
+                'ssh', '-tt', '-o', 'StrictHostKeyChecking=no', '-K',
                 '-l', user1, client.hostname,
-            ], extra_ssh_options=['-t']) as test:
-                test.expect(r'[\$#]\s*$', timeout=30)
-                test.sendline(f"su {user2} -c 'whoami'")
-                test.expect(r'.*assword.*:')
-                test.sendline(self.ad_user_password)
-                test.expect(re.compile(re.escape(user2)))
-                test.sendline('exit')
-                test.expect_exit(
-                    ignore_remaining_output=True, raiseonerr=False
-                )
+                '--', 'su', user2, '-c', 'whoami',
+            ], stdin_text=self.ad_user_password + '\n')
+            assert user2 in result.stdout_text
 
     def test_ssh_password_to_master(self):
         """AD user SSH with password to the IPA master (server mode).
