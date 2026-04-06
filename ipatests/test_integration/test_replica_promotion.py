@@ -1427,7 +1427,9 @@ class TestReplicaPromotionRandomPassword(IntegrationTest):
         replica = self.replicas[0]
         replica.resolver.backup()
         tasks.kinit_admin(self.master)
-        tasks.add_a_record(self.master, replica)
+        tasks.add_dns_record(
+            self.master, self.master.domain.name, replica.hostname + '.',
+            'a', [replica.ip])
         randpasswd = tasks.host_add_with_random_password(self.master,
                                                          replica)
         self.master.run_command([
