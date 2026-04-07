@@ -5,6 +5,8 @@ from __future__ import absolute_import
 import re
 import time
 import textwrap
+from contextlib import contextmanager
+import pytest
 from ipaplatform.paths import paths
 from ipatests.pytest_ipa.integration import tasks
 from ipatests.test_integration.test_trust import BaseTestTrust
@@ -865,3 +867,672 @@ class TestTrustFunctionalHttp(BaseTestTrust):
         tasks.kdestroy_all(self.clients[0])
 
         self._assert_curl_GSSAPI_access_denied()
+
+
+class TestTrustFunctionalSelinuxUsermap(BaseTestTrust):
+    topology = 'line'
+    num_clients = 2
+    num_ad_treedomains = 0
+
+    ADPASS = 'Secret123'
+    SELINUX_STAFF = 'staff_u:s0-s0:c0.c1023'
+    SELINUX_USER_U = 'user_u:s0'
+    SELINUX_XGUEST = 'xguest_u:s0'
+    SELINUX_GUEST = 'guest_u:s0'
+    SELINUX_UNCONFINED_DEFAULT = 'unconfined_u:s0-s0:c0.c1023'
+    G1_EXT = 'ad_testgrp1_ext'
+    G1 = 'ad_testgrp1'
+    G2_EXT = 'ad_testgrp2_ext'
+    G2 = 'ad_testgrp2'
+    SG1_EXT = 'ad_subtestgrp1_ext'
+    SG1 = 'ad_subtestgrp1'
+    SG2_EXT = 'ad_subtestgrp2_ext'
+    SG2 = 'ad_subtestgrp2'
+
+    @classmethod
+    def install(cls, mh):
+        """Prepare trust, AD groups, and SSSD for SELinux user map tests.
+
+        Configures DNS and establishes a one-way trust to AD, creates four
+        external+posix group pairs (forest ``G1``/``G2`` and subdomain
+        ``SG1``/``SG2``) with the usual test AD principals as external
+        members, then clears SSSD
+        caches on the master and both clients so group membership is visible
+        before any test runs.
+        """
+        super().install(mh)
+        tasks.configure_dns_for_trust(cls.master, cls.ad)
+        tasks.establish_trust_with_ad(
+            cls.master, cls.ad_domain,
+            extra_args=['--range-type', 'ipa-ad-trust'])
+        tasks.kinit_admin(cls.master)
+        cls._add_pair(cls.G1_EXT, cls.G1, cls.testuser1)
+        cls._add_pair(cls.G2_EXT, cls.G2, cls.testuser2)
+        cls._add_pair(cls.SG1_EXT, cls.SG1, cls.subaduser)
+        cls._add_pair(cls.SG2_EXT, cls.SG2, cls.subdomaintestuser2)
+        for host in (cls.master, *cls.clients):
+            tasks.clear_sssd_cache(host)
+            tasks.wait_for_sssd_domain_status_online(host)
+
+    def _require_selinux_clients(self):
+        for client_host in self.clients:
+            if not tasks.is_selinux_enabled(client_host):
+                pytest.skip(
+                    'SELinux must be enabled on all clients for id -Z tests'
+                )
+
+    def _sssd_clear_all(self):
+        for host in (self.master, *self.clients):
+            tasks.clear_sssd_cache(host)
+            tasks.wait_for_sssd_domain_status_online(host)
+
+    def _ssh_id_z(self, runner, user, target, password=ADPASS):
+        run_result = runner.run_command(
+            [
+                'sshpass', '-p', password,
+                'ssh',
+                '-o', 'StrictHostKeyChecking=no',
+                '-o', 'PasswordAuthentication=yes',
+                '-o', 'PubkeyAuthentication=no',
+                '-o', 'GSSAPIAuthentication=no',
+                '-l', user, target.hostname, 'id', '-Z',
+            ],
+            raiseonerr=False,
+        )
+        combined_output = (
+            f'{run_result.stdout_text}{run_result.stderr_text}')
+        return combined_output, run_result.returncode
+
+    @classmethod
+    def _unconfined_ctx(cls, output):
+        if re.search(
+                re.escape(cls.SELINUX_UNCONFINED_DEFAULT),
+                output,
+                re.DOTALL,
+        ):
+            return True
+        return re.search(
+            r'unconfined_u:unconfined_r:unconfined_t:s0-s0:c0\.c1023',
+            output,
+        ) is not None
+
+    def _ssh_id_z_assert(self, runner, user, target, role, password=ADPASS):
+        self._sssd_clear_all()
+        run_result = runner.run_command(
+            [
+                'sshpass', '-p', password,
+                'ssh',
+                '-o', 'StrictHostKeyChecking=no',
+                '-o', 'PasswordAuthentication=yes',
+                '-o', 'PubkeyAuthentication=no',
+                '-o', 'GSSAPIAuthentication=no',
+                '-l', user, target.hostname, 'id', '-Z',
+            ]
+        )
+        output = (
+            f'{run_result.stdout_text}{run_result.stderr_text}')
+
+        has_staff = 'staff_u' in output and 's0-s0:c0.c1023' in output
+        # Full contexts look like user_u:user_r:user_t:s0 (not ``user_u:s0``).
+        has_user_u = (
+            re.search(r'user_u:user_r:user_t:s0', output) is not None
+        )
+        has_guest = (
+            re.search(r'guest_u:guest_r:guest_t:s0', output) is not None
+        )
+        # Match xguest full context; do not use bare ``:s0`` (staff has
+        # ``s0-s0``).
+        has_xguest = (
+            re.search(r'xguest_u:xguest_r:xguest_t:s0', output) is not None
+        )
+
+        if role == 'staff':
+            assert has_staff, output
+        elif role == 'unconfined':
+            assert self._unconfined_ctx(output), output
+        elif role == 'not_staff_unconfined':
+            assert (not has_staff and self._unconfined_ctx(output)), output
+        elif role == 'user_u':
+            assert has_user_u, output
+        elif role == 'user_u_not_staff':
+            assert has_user_u and not has_staff, output
+        elif role == 'guest':
+            assert has_guest, output
+        elif role == 'not_guest_unconfined':
+            assert (not has_guest and self._unconfined_ctx(output)), output
+        elif role == 'xguest':
+            assert has_xguest, output
+        elif role == 'not_staff':
+            assert not has_staff, output
+        else:
+            raise ValueError(f'unknown id -Z role: {role!r}')
+        return output, run_result.returncode
+
+    def _ssh_id_z_assert_denied(self, runner, user, target, password=ADPASS):
+        self._sssd_clear_all()
+        run_result = runner.run_command(
+            [
+                'sshpass', '-p', password,
+                'ssh',
+                '-o', 'StrictHostKeyChecking=no',
+                '-o', 'PasswordAuthentication=yes',
+                '-o', 'PubkeyAuthentication=no',
+                '-o', 'GSSAPIAuthentication=no',
+                '-l', user, target.hostname, 'id', '-Z',
+            ],
+            raiseonerr=False,
+        )
+        assert run_result.returncode != 0
+        combined_output = (
+            f'{run_result.stdout_text}{run_result.stderr_text}')
+        return combined_output, run_result.returncode
+
+    @classmethod
+    def _add_pair(cls, external_group_name, posix_group_name,
+                  trusted_member_account):
+        tasks.group_add(
+            cls.master, groupname=external_group_name,
+            extra_args=['--external'])
+        tasks.group_add(cls.master, groupname=posix_group_name)
+        cls.master.run_command([
+            'ipa', '-n', 'group-add-member', '--external',
+            trusted_member_account, external_group_name,
+        ])
+        tasks.group_add_member(
+            cls.master, groupname=posix_group_name,
+            extra_args=[f'--groups={external_group_name}'],
+        )
+
+    @contextmanager
+    def _staff_selinux_user_map_context(
+            self, map_name, posix_group, map_host_hostname):
+        tasks.kinit_admin(self.master)
+        try:
+            tasks.selinuxusermap_add(
+                self.master, map_name,
+                extra_args=[f'--selinuxuser={self.SELINUX_STAFF}'])
+            tasks.selinuxusermap_add_user(
+                self.master, map_name, groups=posix_group)
+            tasks.selinuxusermap_add_host(
+                self.master, map_name, hosts=map_host_hostname)
+            self._sssd_clear_all()
+            yield
+        finally:
+            tasks.kinit_admin(self.master)
+            tasks.selinuxusermap_del(
+                self.master, map_name, raiseonerr=False)
+            self._sssd_clear_all()
+
+    @contextmanager
+    def _hbac_staff_selinux_map_context(
+            self, hbac_rule_name, staff_map_name, posix_group,
+            hbac_host_hostname):
+        tasks.kinit_admin(self.master)
+        try:
+            tasks.hbacrule_add(self.master, hbac_rule_name)
+            tasks.hbacrule_add_user(
+                self.master, hbac_rule_name, groups=posix_group)
+            tasks.hbacrule_add_host(
+                self.master, hbac_rule_name, hosts=hbac_host_hostname)
+            tasks.hbacrule_add_service(
+                self.master, hbac_rule_name, services='sshd')
+            tasks.selinuxusermap_add(
+                self.master, staff_map_name,
+                extra_args=[
+                    f'--selinuxuser={self.SELINUX_STAFF}',
+                    f'--hbacrule={hbac_rule_name}',
+                ])
+            self._sssd_clear_all()
+            yield
+        finally:
+            tasks.kinit_admin(self.master)
+            tasks.selinuxusermap_del(
+                self.master, staff_map_name, raiseonerr=False)
+            self.master.run_command(
+                ['ipa', 'hbacrule-del', hbac_rule_name], raiseonerr=False)
+            self._sssd_clear_all()
+
+    def _run_id_z_case_rows(self, case_rows):
+        for ssh_client, user, target, role in case_rows:
+            self._ssh_id_z_assert(ssh_client, user, target, role)
+
+    def test_ipa_trust_func_selinuxusermap_001(self):
+        self._require_selinux_clients()
+        first_client, second_client = self.clients[0], self.clients[1]
+        cases = [
+            ('selinux_umap_001_ad', self.G1, [
+                (c, self.testuser1, first_client, 'staff')
+                for c in (first_client, second_client)
+            ] + [
+                 (first_client, self.testuser2, first_client,
+                  'not_staff_unconfined'),
+                 (second_client, self.testuser1, second_client,
+                  'not_staff_unconfined'),
+                 (first_client, self.testuser1, second_client, 'unconfined'),
+             ]),
+            ('selinux_umap_001_sub', self.SG1, [
+                (first_client, self.subaduser, first_client, 'staff'),
+                (first_client, self.subaduser, second_client, 'unconfined'),
+                (first_client, self.subdomaintestuser2, first_client,
+                 'not_staff_unconfined'),
+                (second_client, self.subaduser, first_client, 'staff'),
+                (second_client, self.subaduser, second_client,
+                 'not_staff_unconfined'),
+            ]),
+        ]
+        for name, group, rows in cases:
+            with self._staff_selinux_user_map_context(
+                    name, group, first_client.hostname):
+                self._run_id_z_case_rows(rows)
+
+    def test_ipa_trust_func_selinuxusermap_002(self):
+        self._require_selinux_clients()
+        first_client = self.clients[0]
+
+        for name, group, user1, user2 in [
+            ('selinux_umap_002_ad', self.G1,
+             self.testuser1, self.testuser2),
+            ('selinux_umap_002_sub', self.SG1,
+             self.subaduser, self.subdomaintestuser2),
+        ]:
+            with self._staff_selinux_user_map_context(
+                    name, group, self.master.hostname):
+                self._run_id_z_case_rows([
+                    (first_client, user1, self.master, 'staff'),
+                    (first_client, user1, first_client,
+                     'not_staff_unconfined'),
+                    (first_client, user2, self.master,
+                     'not_staff_unconfined'),
+                ])
+
+    def test_ipa_trust_func_selinuxusermap_003(self):
+        self._require_selinux_clients()
+        first_client = self.clients[0]
+        for hbac, umap, group, user1, user2 in [
+            ('hbacrule3_1_ad', 'selinux_umap3_1_ad',
+             self.G1, self.testuser1, self.testuser2),
+            ('hbacrule3_1_sub', 'selinux_umap3_1_sub',
+             self.SG1, self.subaduser, self.subdomaintestuser2),
+        ]:
+            with self._hbac_staff_selinux_map_context(
+                    hbac, umap, group, first_client.hostname):
+                self._run_id_z_case_rows([
+                    (first_client, user1, first_client, 'staff'),
+                    (first_client, user2, first_client,
+                     'not_staff_unconfined'),
+                ])
+
+    def _chain_004_cleanup(self, suffix):
+        admin_allow_all_rule = f'admin_allow_all_{suffix}'
+        hbac_user_u_rule = f'hbacrule4_1_{suffix}'
+        hbac_staff_ssh_rule = f'hbacrule4_2_{suffix}'
+        selinux_map_xguest_allow_all = f'selinux_umap4_0_{suffix}'
+        selinux_map_user_u = f'selinux_umap4_1_{suffix}'
+        selinux_map_staff = f'selinux_umap4_2_{suffix}'
+        tasks.kinit_admin(self.master)
+        for map_name in (
+                selinux_map_staff,
+                selinux_map_user_u,
+                selinux_map_xguest_allow_all):
+            tasks.selinuxusermap_del(
+                self.master, map_name, raiseonerr=False)
+        tasks.hbacrule_del(
+            self.master, hbac_staff_ssh_rule, raiseonerr=False)
+        tasks.hbacrule_del(self.master, hbac_user_u_rule, raiseonerr=False)
+        tasks.hbacrule_enable(self.master, 'allow_all')
+        tasks.hbacrule_del(
+            self.master, admin_allow_all_rule, raiseonerr=False)
+        tasks.hbacrule_enable(self.master, 'allow_all')
+
+    def _chain_004(self, suffix, mapped_posix_group,
+                   trusted_user_primary, trusted_user_secondary):
+        first_client, second_client = self.clients[0], self.clients[1]
+        admin_allow_all_rule = f'admin_allow_all_{suffix}'
+        hbac_user_u_rule = f'hbacrule4_1_{suffix}'
+        hbac_staff_ssh_rule = f'hbacrule4_2_{suffix}'
+        selinux_map_xguest_allow_all = f'selinux_umap4_0_{suffix}'
+        selinux_map_user_u = f'selinux_umap4_1_{suffix}'
+        selinux_map_staff = f'selinux_umap4_2_{suffix}'
+        tasks.kinit_admin(self.master)
+        self.master.run_command([
+            'ipa', 'hbacrule-add', admin_allow_all_rule,
+            '--hostcat=all', '--servicecat=all'])
+        tasks.hbacrule_add_user(
+            self.master, admin_allow_all_rule, groups='admins')
+        tasks.hbacrule_disable(self.master, 'allow_all')
+        tasks.selinuxusermap_add(
+            self.master, selinux_map_xguest_allow_all,
+            extra_args=[f'--selinuxuser={self.SELINUX_XGUEST}'])
+        tasks.selinuxusermap_mod(
+            self.master, selinux_map_xguest_allow_all,
+            extra_args=['--hbacrule=allow_all'])
+        tasks.hbacrule_add(self.master, hbac_user_u_rule)
+        tasks.hbacrule_add_user(
+            self.master, hbac_user_u_rule, groups=mapped_posix_group)
+        for hb_host in (first_client, second_client, self.master):
+            tasks.hbacrule_add_host(
+                self.master, hbac_user_u_rule, hosts=hb_host.hostname)
+        tasks.hbacrule_add_service(
+            self.master, hbac_user_u_rule, services='sshd')
+        tasks.selinuxusermap_add(
+            self.master, selinux_map_user_u,
+            extra_args=[f'--selinuxuser={self.SELINUX_USER_U}'])
+        tasks.selinuxusermap_mod(
+            self.master, selinux_map_user_u,
+            extra_args=[f'--hbacrule={hbac_user_u_rule}'])
+        tasks.hbacrule_add(self.master, hbac_staff_ssh_rule)
+        tasks.hbacrule_add_user(
+            self.master, hbac_staff_ssh_rule, groups=mapped_posix_group)
+        tasks.hbacrule_add_host(
+            self.master, hbac_staff_ssh_rule, hosts=first_client.hostname)
+        tasks.hbacrule_add_service(
+            self.master, hbac_staff_ssh_rule, services='sshd')
+        tasks.selinuxusermap_add(
+            self.master, selinux_map_staff,
+            extra_args=[
+                f'--selinuxuser={self.SELINUX_STAFF}',
+                f'--hbacrule={hbac_staff_ssh_rule}',
+            ])
+        for target, role in (
+                (first_client, 'staff'),
+                (self.master, 'user_u_not_staff'),
+                (second_client, 'user_u_not_staff')):
+            self._ssh_id_z_assert(
+                first_client, trusted_user_primary, target, role)
+        tasks.selinuxusermap_del(self.master, selinux_map_staff)
+        tasks.hbacrule_del(self.master, hbac_staff_ssh_rule)
+        self._ssh_id_z_assert(
+            first_client, trusted_user_primary, first_client,
+            'user_u_not_staff')
+        tasks.selinuxusermap_del(self.master, selinux_map_user_u)
+        tasks.hbacrule_del(self.master, hbac_user_u_rule)
+        tasks.hbacrule_enable(self.master, 'allow_all')
+        self._ssh_id_z_assert(
+            first_client, trusted_user_primary, first_client, 'xguest')
+        self._ssh_id_z_assert(
+            first_client, trusted_user_secondary, first_client, 'xguest')
+        tasks.selinuxusermap_del(self.master, selinux_map_xguest_allow_all)
+        self._ssh_id_z_assert(
+            first_client, trusted_user_primary, first_client, 'unconfined')
+        self._ssh_id_z_assert(
+            first_client, trusted_user_secondary, first_client, 'unconfined')
+        tasks.hbacrule_del(self.master, admin_allow_all_rule)
+        tasks.hbacrule_enable(self.master, 'allow_all')
+
+    def test_ipa_trust_func_selinuxusermap_004(self):
+        self._require_selinux_clients()
+        for suffix, mapped_group, user_primary, user_secondary in (
+                ('ad', self.G1, self.testuser1, self.testuser2),
+                ('sub', self.SG1, self.subaduser, self.subdomaintestuser2)):
+            try:
+                self._chain_004(
+                    suffix, mapped_group, user_primary, user_secondary)
+            finally:
+                self._chain_004_cleanup(suffix)
+                tasks.kinit_admin(self.master)
+                self._sssd_clear_all()
+
+    def _chain_005(self, suffix, mapped_posix_group,
+                   trusted_user_primary, trusted_user_secondary):
+        first_client, second_client = self.clients[0], self.clients[1]
+        second_client_hostgroup = f'hostgrp_selinux_005_{suffix}'
+        selinux_map_name = f'test_user_specific_hostgroup_{suffix}'
+        tasks.kinit_admin(self.master)
+        try:
+            tasks.hostgroup_add(self.master, second_client_hostgroup)
+            tasks.hostgroup_add_member(
+                self.master, second_client_hostgroup,
+                hosts=second_client.hostname)
+            tasks.selinuxusermap_add(
+                self.master, selinux_map_name,
+                extra_args=[f'--selinuxuser={self.SELINUX_GUEST}'])
+            tasks.selinuxusermap_add_host(
+                self.master, selinux_map_name,
+                extra_args=[f'--hostgroups={second_client_hostgroup}'])
+            tasks.selinuxusermap_add_user(
+                self.master, selinux_map_name, groups=mapped_posix_group)
+            self._ssh_id_z_assert(
+                first_client, trusted_user_secondary, second_client, 'guest')
+            self._ssh_id_z_assert(
+                first_client, trusted_user_primary, second_client,
+                'not_guest_unconfined')
+            tasks.selinuxusermap_remove_user(
+                self.master, selinux_map_name, groups=mapped_posix_group)
+            self._ssh_id_z_assert(
+                first_client, trusted_user_secondary, second_client,
+                'not_guest_unconfined')
+        finally:
+            tasks.kinit_admin(self.master)
+            tasks.selinuxusermap_del(
+                self.master, selinux_map_name, raiseonerr=False)
+            tasks.hostgroup_del(
+                self.master, second_client_hostgroup, raiseonerr=False)
+
+    def test_ipa_trust_func_selinuxusermap_005(self):
+        self._require_selinux_clients()
+        for suffix, mapped_group, user_primary, user_secondary in (
+                ('ad', self.G2, self.testuser1, self.testuser2),
+                ('sub', self.SG2, self.subaduser, self.subdomaintestuser2)):
+            try:
+                self._chain_005(
+                    suffix, mapped_group, user_primary, user_secondary)
+            finally:
+                tasks.kinit_admin(self.master)
+                tasks.hbacrule_enable(self.master, 'allow_all')
+                self._sssd_clear_all()
+
+    def _chain_006(self, suffix, mapped_posix_group,
+                   trusted_user_primary, trusted_user_secondary):
+        first_client = self.clients[0]
+        second_client = self.clients[1]
+        hostgroup_second_client = f'hostgrp_selinux_006_{suffix}'
+        selinux_map_name = f'test_u_hostgroup_hbac_{suffix}'
+        hbac_rule_name = f'rule6_{suffix}'
+        tasks.kinit_admin(self.master)
+        try:
+            tasks.hbacrule_disable(self.master, 'allow_all')
+            tasks.hostgroup_add(self.master, hostgroup_second_client)
+            tasks.hostgroup_add_member(
+                self.master, hostgroup_second_client,
+                hosts=second_client.hostname)
+            tasks.hbacrule_add(self.master, hbac_rule_name)
+            tasks.hbacrule_add_service(
+                self.master, hbac_rule_name, services='sshd')
+            tasks.hbacrule_add_user(
+                self.master, hbac_rule_name, groups=mapped_posix_group)
+            self.master.run_command([
+                'ipa', 'hbacrule-add-host', hbac_rule_name,
+                f'--hostgroups={hostgroup_second_client}',
+            ])
+            tasks.selinuxusermap_add(
+                self.master, selinux_map_name,
+                extra_args=[
+                    f'--selinuxuser={self.SELINUX_STAFF}',
+                    f'--hbacrule={hbac_rule_name}',
+                ])
+            self._ssh_id_z_assert(
+                first_client, trusted_user_secondary, second_client, 'staff')
+            self._ssh_id_z_assert_denied(
+                first_client, trusted_user_primary, second_client)
+            tasks.hbacrule_remove_user(
+                self.master, hbac_rule_name, groups=mapped_posix_group)
+            self._ssh_id_z_assert_denied(
+                first_client, trusted_user_secondary, second_client)
+        finally:
+            tasks.kinit_admin(self.master)
+            tasks.hostgroup_del(
+                self.master, hostgroup_second_client, raiseonerr=False)
+            tasks.selinuxusermap_del(
+                self.master, selinux_map_name, raiseonerr=False)
+            tasks.hbacrule_del(self.master, hbac_rule_name, raiseonerr=False)
+            tasks.hbacrule_enable(self.master, 'allow_all')
+
+    def test_ipa_trust_func_selinuxusermap_006(self):
+        self._require_selinux_clients()
+        for suffix, mapped_group, user_primary, user_secondary in (
+                ('ad', self.G2, self.testuser1, self.testuser2),
+                ('sub', self.SG2, self.subaduser, self.subdomaintestuser2)):
+            try:
+                self._chain_006(
+                    suffix, mapped_group, user_primary, user_secondary)
+            finally:
+                tasks.kinit_admin(self.master)
+                tasks.hbacrule_enable(self.master, 'allow_all')
+                self._sssd_clear_all()
+
+    def _chain_007(self, suffix, mapped_posix_group,
+                   trusted_user_primary, trusted_user_secondary):
+        first_client, second_client = self.clients[0], self.clients[1]
+        hostgroup_first_client = f'hostgrp7_1_{suffix}'
+        hostgroup_second_client = f'hostgrp7_2_{suffix}'
+        hbac_rule_name = f'rule7_{suffix}'
+        hbac_ssh_secondary_rule = f'rule7_sshonly_{suffix}'
+        selinux_map_name = f'test_umap_from_hg_{suffix}'
+        secondary_hbac_group = self.G2 if suffix == 'ad' else self.SG2
+        tasks.kinit_admin(self.master)
+        try:
+            self._sssd_clear_all()
+            tasks.hbacrule_disable(self.master, 'allow_all')
+            for hostgroup_name, client_host in (
+                    (hostgroup_first_client, first_client),
+                    (hostgroup_second_client, second_client)):
+                tasks.hostgroup_add(self.master, hostgroup_name)
+                tasks.hostgroup_add_member(
+                    self.master, hostgroup_name, hosts=client_host.hostname)
+            tasks.hbacrule_add(self.master, hbac_rule_name)
+            tasks.hbacrule_add_service(
+                self.master, hbac_rule_name, services='sshd')
+            tasks.hbacrule_add_user(
+                self.master, hbac_rule_name, groups=mapped_posix_group)
+            self.master.run_command([
+                'ipa', 'hbacrule-add-host', hbac_rule_name,
+                f'--hostgroups={hostgroup_first_client}',
+                f'--hostgroups={hostgroup_second_client}',
+            ])
+            tasks.selinuxusermap_add(
+                self.master, selinux_map_name,
+                extra_args=[
+                    f'--selinuxuser={self.SELINUX_STAFF}',
+                    f'--hbacrule={hbac_rule_name}',
+                ])
+            tasks.hbacrule_add(self.master, hbac_ssh_secondary_rule)
+            tasks.hbacrule_add_service(
+                self.master, hbac_ssh_secondary_rule, services='sshd')
+            tasks.hbacrule_add_user(
+                self.master, hbac_ssh_secondary_rule,
+                groups=secondary_hbac_group)
+            self.master.run_command([
+                'ipa', 'hbacrule-add-host', hbac_ssh_secondary_rule,
+                f'--hostgroups={hostgroup_first_client}',
+                f'--hostgroups={hostgroup_second_client}',
+            ])
+            for ssh_target_host in (first_client, second_client):
+                self._ssh_id_z_assert(
+                    first_client, trusted_user_primary, ssh_target_host,
+                    'staff')
+            self._ssh_id_z_assert(
+                first_client, trusted_user_secondary, first_client,
+                'not_staff')
+
+            tasks.hbacrule_remove_user(
+                self.master, hbac_rule_name, groups=mapped_posix_group)
+            self._ssh_id_z_assert_denied(
+                first_client, trusted_user_primary, first_client)
+        finally:
+            tasks.kinit_admin(self.master)
+            tasks.selinuxusermap_del(
+                self.master, selinux_map_name, raiseonerr=False)
+            tasks.hostgroup_del(
+                self.master, hostgroup_first_client, raiseonerr=False)
+            tasks.hostgroup_del(
+                self.master, hostgroup_second_client, raiseonerr=False)
+            tasks.hbacrule_del(
+                self.master, hbac_ssh_secondary_rule, raiseonerr=False)
+            tasks.hbacrule_del(self.master, hbac_rule_name, raiseonerr=False)
+            tasks.hbacrule_enable(self.master, 'allow_all')
+
+    def test_ipa_trust_func_selinuxusermap_007(self):
+        self._require_selinux_clients()
+        for suffix, mapped_group, user_primary, user_secondary in (
+                ('ad', self.G1, self.testuser1, self.testuser2),
+                ('sub', self.SG1, self.subaduser, self.subdomaintestuser2)):
+            try:
+                self._chain_007(
+                    suffix, mapped_group, user_primary, user_secondary)
+            finally:
+                tasks.kinit_admin(self.master)
+                tasks.hbacrule_enable(self.master, 'allow_all')
+                self._sssd_clear_all()
+
+    def test_ipa_trust_func_selinuxusermap_008(self):
+        self._require_selinux_clients()
+        first_client = self.clients[0]
+        tasks.kinit_admin(self.master)
+        try:
+            self.master.run_command(
+                ['ipa', 'config-mod', '--ipaselinuxusermapdefault='])
+            trusted_users = (
+                self.testuser1,
+                self.testuser2,
+                self.subaduser,
+                self.subdomaintestuser2,
+            )
+            for trusted_user in trusted_users:
+                self._ssh_id_z_assert(
+                    first_client, trusted_user, first_client, 'unconfined')
+        finally:
+            tasks.kinit_admin(self.master)
+            default = self.SELINUX_UNCONFINED_DEFAULT
+            self.master.run_command([
+                'ipa', 'config-mod',
+                '--ipaselinuxusermapdefault=' + default,
+            ])
+
+    def _chain_009(self, suffix, mapped_posix_group,
+                   trusted_user_primary, _trusted_user_secondary):
+        first_client, second_client = self.clients[0], self.clients[1]
+        selinux_map_xguest = f'selinux_umap9a_{suffix}'
+        selinux_map_user_u = f'selinux_umap9b_{suffix}'
+        selinux_map_guest = f'selinux_umap9c_{suffix}'
+        tasks.kinit_admin(self.master)
+        try:
+            for map_name, selinux_user in (
+                    (selinux_map_xguest, self.SELINUX_XGUEST),
+                    (selinux_map_user_u, self.SELINUX_USER_U),
+                    (selinux_map_guest, self.SELINUX_GUEST)):
+                tasks.selinuxusermap_add(
+                    self.master, map_name,
+                    extra_args=[f'--selinuxuser={selinux_user}'])
+                tasks.selinuxusermap_add_user(
+                    self.master, map_name, groups=mapped_posix_group)
+                tasks.selinuxusermap_add_host(
+                    self.master, map_name, hosts=first_client.hostname)
+            self._ssh_id_z_assert(
+                first_client, trusted_user_primary, first_client, 'user_u')
+            self._ssh_id_z_assert(
+                first_client, trusted_user_primary, second_client,
+                'unconfined')
+
+            tasks.selinuxusermap_disable(self.master, selinux_map_user_u)
+            self._ssh_id_z_assert(
+                first_client, trusted_user_primary, first_client, 'xguest')
+        finally:
+            tasks.kinit_admin(self.master)
+            for map_name in (
+                    selinux_map_xguest,
+                    selinux_map_user_u,
+                    selinux_map_guest):
+                tasks.selinuxusermap_del(
+                    self.master, map_name, raiseonerr=False)
+
+    def test_ipa_trust_func_selinuxusermap_009(self):
+        self._require_selinux_clients()
+        for suffix, mapped_group, user_primary, user_secondary in (
+                ('ad', self.G1, self.testuser1, self.testuser2),
+                ('sub', self.SG1, self.subaduser, self.subdomaintestuser2)):
+            try:
+                self._chain_009(
+                    suffix, mapped_group, user_primary, user_secondary)
+            finally:
+                tasks.kinit_admin(self.master)
+                self._sssd_clear_all()
