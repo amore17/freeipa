@@ -17,8 +17,7 @@ from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.twofactor.hotp import HOTP
 from cryptography.hazmat.primitives.twofactor.totp import TOTP
 from ldap.controls.simple import BooleanControl
-from paramiko import AuthenticationException
-
+import asyncssh
 from ipalib import errors
 from ipaplatform.osinfo import osinfo
 from ipaplatform.paths import paths
@@ -785,7 +784,7 @@ class TestOTPToken(IntegrationTest):
                 'Enter first factor:': PASSWORD,
                 'Enter second factor:': otpvalue
             }
-            with pytest.raises(AuthenticationException):
+            with pytest.raises(asyncssh.PermissionDenied):
                 # ssh should fail and NOT ask for a password
                 ssh_2f(master.hostname, USER1, answers,
                        unwanted_prompt="Password:")
