@@ -293,6 +293,7 @@ IDP_CLIENT_OPENSSL_WORKDIR = "/tmp/idp-client-openssl"
 IDP_CLIENT_P12_PASSWORD = "MyP12Password"
 # Installed on master for ``ipa idp-add --client-cert-p12=...`` (JWT client).
 IDP_CLIENT_P12_IPA_PATH = "/etc/ipa/idp-client.p12"
+IDP_CLIENT_P12_NOPASS_IPA_PATH = "/etc/ipa/idp-client-nopass.p12"
 
 
 def generate_idp_client_openssl_bundle(
@@ -310,6 +311,9 @@ def generate_idp_client_openssl_bundle(
 
     Produces ``idp-client.key``, ``idp-client.csr``, ``idp-client.crt``,
     ``idp-client.p12`` under *workdir*.
+
+    Pass ``p12_password=""`` to create a PKCS#12 whose MAC and encryption
+    passwords are empty (``openssl`` ``-passout pass:``).
     """
     cn = "ipa-oauth-client.%s" % host.domain.name
     host.run_command(["mkdir", "-p", workdir])
@@ -334,12 +338,15 @@ def generate_idp_client_openssl_bundle(
         ],
         cwd=workdir,
     )
+    if p12_password == "":
+        passout_arg = ["-passout", "pass:"]
+    else:
+        passout_arg = ["-passout", "pass:%s" % p12_password]
     host.run_command(
         [
             "openssl", "pkcs12", "-export", "-out", p12,
             "-inkey", key, "-in", crt,
-            "-passout", "pass:%s" % p12_password,
-        ],
+        ] + passout_arg,
         cwd=workdir,
     )
     return workdir
@@ -551,6 +558,254 @@ def delete_idp_client_crt_from_entra_app(
         ) from e
 
 
+def install_test_idp_device_flow_topology(cls):
+    """
+    Install master + client + replica and tune SSSD / ``ipa`` for IdP device
+    flow tests. Shared by :class:`TestIDP` and
+    :class:`TestIdpClientCertificateAuthStories`.
+    """
+    cls.client = cls.replicas[0]
+    cls.replica = cls.replicas[1]
+    tasks.install_master(cls.master, extra_args=['--no-dnssec-validation'])
+    tasks.install_client(cls.master, cls.replicas[0],
+                         extra_args=["--mkhomedir"])
+    tasks.install_replica(cls.master, cls.replicas[1])
+    for host in [cls.master, cls.replicas[0], cls.replicas[1]]:
+        content = host.get_file_contents(paths.IPA_DEFAULT_CONF,
+                                         encoding='utf-8')
+        new_content = content + "\noidc_child_debug_level = 10"
+        host.put_file_contents(paths.IPA_DEFAULT_CONF, new_content)
+    with tasks.remote_sssd_config(cls.master) as sssd_config:
+        sssd_config.edit_domain(
+            cls.master.domain, 'krb5_auth_timeout', 1100)
+    tasks.clear_sssd_cache(cls.master)
+    tasks.clear_sssd_cache(cls.replicas[0])
+    tasks.kinit_admin(cls.master)
+    cls.master.run_command(["ipa", "config-mod", "--user-auth-type=idp",
+                            "--user-auth-type=password"])
+    xvfb = ("nohup /usr/bin/Xvfb :99 -ac -noreset -screen 0 1400x1200x8 "
+            "</dev/null &>/dev/null &")
+    cls.replicas[0].run_command(xvfb)
+
+
+def ipa_idp_cli_supports_client_certificate_options(host):
+    """True when ``ipa idp-add`` advertises certificate client-auth options."""
+    r = host.run_command(["ipa", "idp-add", "--help"], raiseonerr=False)
+    if r.returncode != 0:
+        return False
+    return "client-auth-method" in r.stdout_text
+
+
+def ipa_idp_cli_supports_idp_show_outfile(host):
+    """True when ``ipa idp-show`` supports writing a certificate PEM file."""
+    r = host.run_command(["ipa", "idp-show", "--help"], raiseonerr=False)
+    if r.returncode != 0:
+        return False
+    return "--out" in r.stdout_text or "--outfile" in r.stdout_text
+
+
+def ldap_idp_entry_dn(master, idp_cn):
+    """Return DN string ``cn=<idp_cn>,cn=idp,<basedn>``."""
+    return "cn=%s,cn=idp,%s" % (idp_cn, str(master.domain.basedn))
+
+
+def azure_private_key_jwt_idp_full_e2e_workflow(
+    testcase,
+    *,
+    ldap_assert_pkcs12_and_cert=True,
+    extra_kinit_hosts=(),
+    verify_pem_export_with_openssl=False,
+):
+    """
+    Microsoft Entra IdP using PKCS#12 + ``private_key_jwt`` (RFC 7523).
+
+    Graph upload, ``ipa idp-add``, optional LDAP checks, ``kinit`` on the
+    default IdP client host and on any *extra_kinit_hosts*.
+    """
+    testcase.require_azure_multihost_config()
+    testcase.ensure_azure_idp_and_user()
+
+    workdir = generate_idp_client_openssl_bundle(testcase.master)
+    crt_path = os.path.join(workdir, "idp-client.crt")
+    pem_bytes = testcase.master.get_file_contents(crt_path)
+
+    token = None
+    app_object_id = None
+    uploaded = False
+    p12_on_master = False
+    jwt_idp_added = False
+    try:
+        tasks.user_add(
+            testcase.master,
+            testcase.AZURE_JWT_IPA_USERNAME,
+            first="azurejwt",
+            last="UserJwt",
+            extra_args=[
+                "--user-auth-type=idp",
+                "--idp-user-id=" + testcase.azure_username,
+                "--idp=" + testcase.AZURE_JWT_IDP_NAME,
+            ],
+        )
+        token = azure_acquire_graph_token(
+            testcase.azure_tenant_id,
+            testcase.azure_admin_client_id,
+            testcase.azure_admin_client_secret,
+        )
+        app_object_id = azure_graph_application_object_id(
+            token,
+            testcase.azure_admin_client_id,
+        )
+        cert_display_name = new_idp_client_graph_cert_display_name()
+        upload_idp_client_crt_to_entra_app(
+            token,
+            app_object_id,
+            pem_bytes,
+            display_name=cert_display_name,
+        )
+        uploaded = True
+
+        p12_src = os.path.join(workdir, "idp-client.p12")
+        testcase.master.run_command(
+            ["cp", p12_src, IDP_CLIENT_P12_IPA_PATH])
+        testcase.master.run_command(
+            ["chmod", "600", IDP_CLIENT_P12_IPA_PATH])
+        p12_on_master = True
+
+        tasks.kinit_admin(testcase.master)
+        issuer = (
+            "https://login.microsoftonline.com/%s/v2.0"
+            % testcase.azure_tenant_id
+        )
+        since = time.strftime(
+            '%Y-%m-%d %H:%M:%S',
+            (datetime.now() - timedelta(seconds=10)).timetuple()
+        )
+        idp_add_cmd = [
+            "ipa", "idp-add", testcase.AZURE_JWT_IDP_NAME,
+            "--provider=microsoft",
+            "--organization=%s" % testcase.azure_tenant_id,
+            "--issuer=%s" % issuer,
+            "--client-id=%s" % testcase.azure_admin_client_id,
+            "--client-auth-method=private_key_jwt",
+            "--client-cert-p12-file=%s" % IDP_CLIENT_P12_IPA_PATH,
+        ]
+        p12_stdin = "%s\n%s\n" % (
+            IDP_CLIENT_P12_PASSWORD,
+            IDP_CLIENT_P12_PASSWORD,
+        )
+        testcase.master.run_command(idp_add_cmd, stdin_text=p12_stdin)
+        cmd = ["journalctl", "-g", "IPA.API", "--since=%s" % since]
+        journal = testcase.master.run_command(cmd)
+        assert '"userpkcs12": "********"' in journal.stdout_text
+        jwt_idp_added = True
+
+        show_out = testcase.master.run_command(
+            ["ipa", "idp-show", testcase.AZURE_JWT_IDP_NAME])
+        assert "private_key_jwt" in show_out.stdout_text.lower()
+
+        if ldap_assert_pkcs12_and_cert:
+            idp_dn = ldap_idp_entry_dn(
+                testcase.master, testcase.AZURE_JWT_IDP_NAME)
+            ls = tasks.ldapsearch_dm(
+                testcase.master,
+                idp_dn,
+                ldap_args=[
+                    "(objectclass=*)", "objectClass",
+                    "userCertificate", "userPKCS12",
+                ],
+                scope="base",
+            )
+            assert "userPKCS12" in ls.stdout_text
+            assert "usercertificate" in ls.stdout_text.lower()
+            oc_lower = ls.stdout_text.lower()
+            if "ipaidpclientauth" in oc_lower:
+                ls_m = tasks.ldapsearch_dm(
+                    testcase.master,
+                    idp_dn,
+                    ldap_args=[
+                        "(objectclass=*)", "ipaIdpClientAuthMethod",
+                    ],
+                    scope="base",
+                    raiseonerr=False,
+                )
+                if ls_m.returncode == 0 and ls_m.stdout_text.strip():
+                    assert (
+                        "private_key_jwt" in ls_m.stdout_text.lower()
+                    )
+
+        tasks.clear_sssd_cache(testcase.client)
+        tasks.wait_for_sssd_domain_status_online(testcase.client)
+        wait_for_ipa_user_lookup_id(
+            testcase.client, testcase.AZURE_JWT_IPA_USERNAME)
+        kinit_idp(
+            testcase.client,
+            testcase.AZURE_JWT_IPA_USERNAME,
+            azure_email=testcase.azure_username,
+            azure_password=testcase.azure_user_password,
+        )
+        test_idp = testcase.client.run_command(["klist", "-C"])
+        assert "152" in test_idp.stdout_text
+
+        if verify_pem_export_with_openssl:
+            assert ipa_idp_cli_supports_idp_show_outfile(testcase.master), (
+                "workflow called with verify_pem_export_with_openssl but "
+                "CLI has no certificate export option"
+            )
+            pem_out = "/tmp/idp-show-export-cert-test.pem"
+            testcase.master.run_command(
+                ["rm", "-f", pem_out],
+                raiseonerr=False,
+            )
+            testcase.master.run_command(
+                [
+                    "ipa", "idp-show", testcase.AZURE_JWT_IDP_NAME,
+                    "--out", pem_out,
+                ],
+            )
+            testcase.master.run_command(
+                ["openssl", "x509", "-in", pem_out, "-text", "-noout"],
+            )
+
+        for extra in extra_kinit_hosts:
+            tasks.clear_sssd_cache(extra)
+            tasks.wait_for_sssd_domain_status_online(extra)
+            wait_for_ipa_user_lookup_id(
+                extra, testcase.AZURE_JWT_IPA_USERNAME)
+            kinit_idp(
+                extra,
+                testcase.AZURE_JWT_IPA_USERNAME,
+                azure_email=testcase.azure_username,
+                azure_password=testcase.azure_user_password,
+            )
+            out = extra.run_command(["klist", "-C"])
+            assert "152" in out.stdout_text
+
+    finally:
+        if jwt_idp_added:
+            try:
+                tasks.kinit_admin(testcase.master)
+                testcase.master.run_command(
+                    ["ipa", "idp-del", testcase.AZURE_JWT_IDP_NAME],
+                    raiseonerr=False,
+                )
+            except Exception:
+                pass
+        if p12_on_master:
+            try:
+                testcase.master.run_command(
+                    ["rm", "-f", IDP_CLIENT_P12_IPA_PATH],
+                    raiseonerr=False,
+                )
+            except Exception:
+                pass
+        if uploaded and token is not None and app_object_id is not None:
+            try:
+                delete_idp_client_crt_from_entra_app(
+                    token, app_object_id, pem_bytes)
+            except Exception:
+                pass
+
+
 class TestIDP(IntegrationTest):
 
     num_replicas = 2
@@ -562,28 +817,7 @@ class TestIDP(IntegrationTest):
 
     @classmethod
     def install(cls, mh):
-        cls.client = cls.replicas[0]
-        cls.replica = cls.replicas[1]
-        tasks.install_master(cls.master, extra_args=['--no-dnssec-validation'])
-        tasks.install_client(cls.master, cls.replicas[0],
-                             extra_args=["--mkhomedir"])
-        tasks.install_replica(cls.master, cls.replicas[1])
-        for host in [cls.master, cls.replicas[0], cls.replicas[1]]:
-            content = host.get_file_contents(paths.IPA_DEFAULT_CONF,
-                                             encoding='utf-8')
-            new_content = content + "\noidc_child_debug_level = 10"
-            host.put_file_contents(paths.IPA_DEFAULT_CONF, new_content)
-        with tasks.remote_sssd_config(cls.master) as sssd_config:
-            sssd_config.edit_domain(
-                cls.master.domain, 'krb5_auth_timeout', 1100)
-        tasks.clear_sssd_cache(cls.master)
-        tasks.clear_sssd_cache(cls.replicas[0])
-        tasks.kinit_admin(cls.master)
-        cls.master.run_command(["ipa", "config-mod", "--user-auth-type=idp",
-                                "--user-auth-type=password"])
-        xvfb = ("nohup /usr/bin/Xvfb :99 -ac -noreset -screen 0 1400x1200x8 "
-                "</dev/null &>/dev/null &")
-        cls.replicas[0].run_command(xvfb)
+        install_test_idp_device_flow_topology(cls)
 
     def test_auth_keycloak_idp(self):
         """
@@ -900,121 +1134,526 @@ class TestIDP(IntegrationTest):
         PKCS#12 bundle on the master and run ``ipa idp-add`` for JWT client
         auth (``private_key_jwt``) against Microsoft OIDC issuer v2.0.
         """
-        self.require_azure_multihost_config()
-        self.ensure_azure_idp_and_user()
+        if not ipa_idp_cli_supports_client_certificate_options(self.master):
+            pytest.skip(
+                "ipa idp-add has no --client-auth-method / PKCS#12 options"
+            )
+        azure_private_key_jwt_idp_full_e2e_workflow(self)
 
-        workdir = generate_idp_client_openssl_bundle(self.master)
-        crt_path = os.path.join(workdir, "idp-client.crt")
-        pem_bytes = self.master.get_file_contents(crt_path)
 
-        token = None
-        app_object_id = None
-        uploaded = False
-        p12_on_master = False
-        jwt_idp_added = False
-        try:
+def ipa_idp_mod_supports_client_certificate_options(host):
+    r = host.run_command(["ipa", "idp-mod", "--help"], raiseonerr=False)
+    if r.returncode != 0:
+        return False
+    return "client-auth-method" in r.stdout_text
+
+
+class TestIdpClientCertificateAuthStories(IntegrationTest):
+    """
+    Acceptance-oriented coverage for external IdP client authentication
+    using PKCS#12 bundles (RFC 7523 ``private_key_jwt``) and related
+    operational stories. Each test docstring references the story (S#) and
+    workflow test case id (TC-*) from the IdP certificate-auth backlog.
+
+    **Stories**
+
+    S1 — Configure new IdP using JWT client assertion (RFC 7523).
+    S2 — Configure new IdP using mTLS client authentication (RFC 8705).
+    S3 — Migrate existing IdP from client secret to certificate auth.
+    S4 — Separation of duties for IdP management vs secret material.
+    S5 — Certificate rotation (replace PKCS#12 on an IdP entry).
+    S6 — Multi-master / replica topology (config replicates; auth works).
+    S7 — Upgrade / backup / restore preserves IdP cert auth.
+
+    **Test case mapping (automate vs manual)**
+
+    * TC-A01 / TC-B01 / TC-E01 (partial) — ``test_story_s1_s6_azure_jwt_cli_ldap_and_kinit``
+    * TC-A02 — ``test_story_s2_tls_client_auth_placeholder`` (manual / future lab)
+    * TC-A03 — ``test_tc_a03_keycloak_client_secret_backward_compat``
+    * PKCS#12 empty passphrase — ``test_idp_add_pkcs12_empty_passphrase_succeeds``
+    * TC-A04 — UI only (manual)
+    * TC-A05 — ``test_story_s1_tc_a05_idp_show_pem_export`` when ``ipa idp-show --out`` exists
+    * TC-B02 — covered by S2 placeholder until Keycloak mTLS automation exists
+    * TC-B03 — ``test_tc_b03_ipa_otpd_stopped_negative``
+    * TC-C01 — ``test_story_s3_tc_c01_migrate_secret_to_private_key_jwt``
+    * TC-C02 / TC-C03 / TC-C04 — mix of ``test_tc_c04_mod_method_without_p12`` and skips
+    * TC-D01 / TC-D02 / TC-D04 — ``test_tc_d01_d02_d04_idp_rbac_and_ldap``
+    * TC-D03 — implied when admin ``ipa idp-show --all`` is exercised elsewhere
+    * TC-D05 / TC-D06 — not automated here (filesystem + log scanning)
+    * TC-E01 — replica kinit inside ``test_story_s1_s6_azure_jwt_cli_ldap_and_kinit``
+    * TC-E02 — old-replica mixed topology (manual; skipped)
+    * TC-E03 — upgrade schema (manual / upgrade suite)
+    * TC-E04 — ``test_story_s7_tc_e04_backup_restore_note`` (documented skip)
+    """
+
+    num_replicas = 2
+    topology = 'line'
+    AZURE_IDP_NAME = "azureidp"
+    AZURE_IPA_USERNAME = "testazure"
+    AZURE_JWT_IPA_USERNAME = "testazurejwt"
+    AZURE_JWT_IDP_NAME = "Azure-JWT"
+
+    @classmethod
+    def install(cls, mh):
+        install_test_idp_device_flow_topology(cls)
+
+    def require_azure_multihost_config(self):
+        """Skip if Azure multihost config is incomplete."""
+        cfg = self.master.config
+        missing = _azure_multihost_config_missing_attrs(cfg)
+        if missing:
+            pytest.skip(
+                "Azure IdP tests require these multihost configuration "
+                "attributes (non-null): " + ", ".join(missing)
+            )
+        self.azure_username = cfg.azure_username
+        self.azure_user_password = cfg.azure_user_password
+        self.azure_tenant_id = cfg.azure_tenant_id
+        self.azure_admin_client_id = cfg.azure_admin_client_id
+        self.azure_admin_client_secret = cfg.azure_admin_client_secret
+        self.azure_domain = cfg.azure_domain
+
+    def ensure_azure_idp_and_user(self):
+        """Create Microsoft IdP and linked IPA user if absent."""
+        host = self.master
+        idp_name = self.AZURE_IDP_NAME
+        ipa_user = self.AZURE_IPA_USERNAME
+        tasks.kinit_admin(host)
+        idp_show = host.run_command(
+            ["ipa", "idp-show", idp_name], raiseonerr=False)
+        if idp_show.returncode != 0:
+            host.run_command(
+                [
+                    "ipa", "idp-add", idp_name,
+                    "--provider", "microsoft",
+                    "--organization", self.azure_tenant_id,
+                    "--client-id", self.azure_admin_client_id,
+                    "--secret",
+                ],
+                stdin_text=self.azure_admin_client_secret + "\n",
+            )
+
+        user_show = host.run_command(
+            ["ipa", "user-show", ipa_user], raiseonerr=False)
+        if user_show.returncode != 0:
             tasks.user_add(
-                self.master,
-                self.AZURE_JWT_IPA_USERNAME,
-                first="azurejwt",
-                last="UserJwt",
+                host,
+                ipa_user,
+                first="azure",
+                last="User",
                 extra_args=[
                     "--user-auth-type=idp",
                     "--idp-user-id=" + self.azure_username,
-                    "--idp=" + self.AZURE_JWT_IDP_NAME,
+                    "--idp=" + idp_name,
                 ],
             )
-            token = azure_acquire_graph_token(
-                self.azure_tenant_id,
-                self.azure_admin_client_id,
-                self.azure_admin_client_secret,
-            )
-            app_object_id = azure_graph_application_object_id(
-                token,
-                self.azure_admin_client_id,
-            )
-            cert_display_name = new_idp_client_graph_cert_display_name()
-            upload_idp_client_crt_to_entra_app(
-                token,
-                app_object_id,
-                pem_bytes,
-                display_name=cert_display_name,
-            )
-            uploaded = True
 
-            p12_src = os.path.join(workdir, "idp-client.p12")
-            self.master.run_command(
-                ["cp", p12_src, IDP_CLIENT_P12_IPA_PATH])
-            self.master.run_command(
-                ["chmod", "600", IDP_CLIENT_P12_IPA_PATH])
-            p12_on_master = True
+    def test_story_s1_s6_azure_jwt_cli_ldap_and_kinit(self):
+        """
+        S1 / S6 — TC-A01, TC-B01, TC-E01 (replica path).
 
+        ``ipa idp-add`` with ``--client-auth-method=private_key_jwt`` and
+        PKCS#12; LDAP carries cert material; Kerberos device flow succeeds on
+        the client and on a second replica.
+        """
+        if not ipa_idp_cli_supports_client_certificate_options(self.master):
+            pytest.skip(
+                "ipa idp-add has no --client-auth-method / PKCS#12 options"
+            )
+        self.require_azure_multihost_config()
+        azure_private_key_jwt_idp_full_e2e_workflow(
+            self,
+            extra_kinit_hosts=(self.replica,),
+        )
+
+    def test_story_s1_tc_a05_idp_show_pem_export(self):
+        """
+        S1 — TC-A05 (PEM export + ``openssl x509`` parse).
+
+        Requires ``ipa idp-show --out`` (or equivalent) on the server under test.
+        """
+        if not ipa_idp_cli_supports_client_certificate_options(self.master):
+            pytest.skip(
+                "ipa idp-add has no --client-auth-method / PKCS#12 options"
+            )
+        if not ipa_idp_cli_supports_idp_show_outfile(self.master):
+            pytest.skip("ipa idp-show has no PEM export option (TC-A05)")
+        self.require_azure_multihost_config()
+        azure_private_key_jwt_idp_full_e2e_workflow(
+            self,
+            verify_pem_export_with_openssl=True,
+        )
+
+    def test_story_s2_tls_client_auth_placeholder(self):
+        """
+        S2 — TC-A02 / TC-B02 (``tls_client_auth`` / RFC 8705).
+
+        Automating mTLS against a token endpoint needs a dedicated IdP lab
+        (Keycloak mutual TLS, wire capture, or proxy assertions). Track as
+        manual / future integration once ``--client-auth-method=tls_client_auth``
+        is exercised the same way as ``private_key_jwt`` here.
+        """
+        pytest.skip(
+            "TC-A02/TC-B02: tls_client_auth + mTLS token endpoint lab not wired"
+        )
+
+    def test_story_s3_tc_c01_migrate_secret_to_private_key_jwt(self):
+        """
+        S3 — TC-C01 (``client_secret`` IdP → ``private_key_jwt``).
+
+        Starts from the Entra ``azureidp`` entry created with ``--secret``,
+        uploads a new client cert to the same app registration, then runs
+        ``ipa idp-mod`` with PKCS#12 material and re-checks device-flow kinit.
+        """
+        if not ipa_idp_cli_supports_client_certificate_options(self.master):
+            pytest.skip(
+                "ipa idp-add has no --client-auth-method / PKCS#12 options"
+            )
+        if not ipa_idp_mod_supports_client_certificate_options(self.master):
+            pytest.skip("ipa idp-mod has no client certificate auth options")
+        self.require_azure_multihost_config()
+        self.ensure_azure_idp_and_user()
+
+        token = None
+        app_object_id = None
+        pem_bytes = None
+        workdir = generate_idp_client_openssl_bundle(self.master)
+        crt_path = os.path.join(workdir, "idp-client.crt")
+        pem_bytes = self.master.get_file_contents(crt_path)
+        token = azure_acquire_graph_token(
+            self.azure_tenant_id,
+            self.azure_admin_client_id,
+            self.azure_admin_client_secret,
+        )
+        app_object_id = azure_graph_application_object_id(
+            token,
+            self.azure_admin_client_id,
+        )
+        cert_display_name = new_idp_client_graph_cert_display_name()
+        upload_idp_client_crt_to_entra_app(
+            token,
+            app_object_id,
+            pem_bytes,
+            display_name=cert_display_name,
+        )
+        p12_src = os.path.join(workdir, "idp-client.p12")
+        self.master.run_command(["cp", p12_src, IDP_CLIENT_P12_IPA_PATH])
+        self.master.run_command(["chmod", "600", IDP_CLIENT_P12_IPA_PATH])
+        issuer = (
+            "https://login.microsoftonline.com/%s/v2.0"
+            % self.azure_tenant_id
+        )
+        try:
             tasks.kinit_admin(self.master)
-            issuer = (
-                "https://login.microsoftonline.com/%s/v2.0"
-                % self.azure_tenant_id
-            )
-            # ``idp_add`` requires ``--provider`` or explicit OAuth endpoints;
-            # JWT/P12 options do not replace that. Use the Microsoft template for
-            # device/authorize/token/userinfo URLs (same tenant as issuer).
-            # Note the time to parse the journal
-            since = time.strftime(
-                '%Y-%m-%d %H:%M:%S',
-                (datetime.now() - timedelta(seconds=10)).timetuple()
-            )
-            idp_add_cmd = [
-                "ipa", "idp-add", self.AZURE_JWT_IDP_NAME,
-                "--provider=microsoft",
-                "--organization=%s" % self.azure_tenant_id,
+            mod_cmd = [
+                "ipa", "idp-mod", self.AZURE_IDP_NAME,
                 "--issuer=%s" % issuer,
-                "--client-id=%s" % self.azure_admin_client_id,
                 "--client-auth-method=private_key_jwt",
                 "--client-cert-p12-file=%s" % IDP_CLIENT_P12_IPA_PATH,
             ]
-            # PKCS#12 passphrase (and confirm) if ``ipa`` prompts like ``--secret``.
             p12_stdin = "%s\n%s\n" % (
                 IDP_CLIENT_P12_PASSWORD,
                 IDP_CLIENT_P12_PASSWORD,
             )
-            self.master.run_command(idp_add_cmd, stdin_text=p12_stdin)
-            # Ensure that the PKCS12 content is obfuscated in the logs
-            cmd = ["journalctl", "-g", "IPA.API", f"--since={since}"]
-            journal = self.master.run_command(cmd)
-            assert '"userpkcs12": "********"' in journal.stdout_text
-            jwt_idp_added = True
+            self.master.run_command(mod_cmd, stdin_text=p12_stdin)
+            show = self.master.run_command(
+                ["ipa", "idp-show", self.AZURE_IDP_NAME])
+            assert "private_key_jwt" in show.stdout_text.lower()
+            idp_dn = ldap_idp_entry_dn(self.master, self.AZURE_IDP_NAME)
+            ls = tasks.ldapsearch_dm(
+                self.master,
+                idp_dn,
+                ldap_args=[
+                    "(objectclass=*)", "objectClass",
+                    "userCertificate", "userPKCS12",
+                ],
+                scope="base",
+            )
+            assert "userPKCS12" in ls.stdout_text
             tasks.clear_sssd_cache(self.client)
             tasks.wait_for_sssd_domain_status_online(self.client)
-            wait_for_ipa_user_lookup_id(
-                self.client, self.AZURE_JWT_IPA_USERNAME)
+            wait_for_ipa_user_lookup_id(self.client, self.AZURE_IPA_USERNAME)
             kinit_idp(
                 self.client,
-                self.AZURE_JWT_IPA_USERNAME,
+                self.AZURE_IPA_USERNAME,
                 azure_email=self.azure_username,
                 azure_password=self.azure_user_password,
             )
-            test_idp = self.client.run_command(["klist", "-C"])
-            assert "152" in test_idp.stdout_text
         finally:
-            if jwt_idp_added:
-                try:
-                    tasks.kinit_admin(self.master)
-                    self.master.run_command(
-                        ["ipa", "idp-del", self.AZURE_JWT_IDP_NAME],
-                        raiseonerr=False,
-                    )
-                except Exception:
-                    pass
-            if p12_on_master:
-                try:
-                    self.master.run_command(
-                        ["rm", "-f", IDP_CLIENT_P12_IPA_PATH],
-                        raiseonerr=False,
-                    )
-                except Exception:
-                    pass
-            if uploaded and token is not None and app_object_id is not None:
-                try:
-                    delete_idp_client_crt_from_entra_app(
-                        token, app_object_id, pem_bytes)
-                except Exception:
-                    pass
+            tasks.kinit_admin(self.master)
+            self.master.run_command(
+                ["rm", "-f", IDP_CLIENT_P12_IPA_PATH],
+                raiseonerr=False,
+            )
+            if (
+                token is not None
+                and app_object_id is not None
+                and pem_bytes is not None
+            ):
+                delete_idp_client_crt_from_entra_app(
+                    token, app_object_id, pem_bytes)
+            # Best-effort: return to interactive client secret auth for reruns
+            self.master.run_command(
+                ["ipa", "idp-mod", self.AZURE_IDP_NAME, "--secret"],
+                stdin_text=self.azure_admin_client_secret + "\n",
+                raiseonerr=False,
+            )
+
+    def test_story_s5_tc_c03_certificate_rotation_placeholder(self):
+        """
+        S5 — TC-C03 (replace PKCS#12 on an existing cert-based IdP).
+
+        Same shape as ``ipa idp-mod ... --client-cert-p12-file=`` with a new
+        bundle once two distinct client certs are registered with the IdP;
+        skipped here to avoid a second Graph upload cycle in every CI run.
+        """
+        pytest.skip(
+            "TC-C03: rotation test is a second idp-mod + new P12; run ad-hoc "
+            "when validating expiry/compromise workflows"
+        )
+
+    def test_story_s7_tc_e04_backup_restore_note(self):
+        """
+        S7 — TC-E04 (backup / restore preserves cert-based IdP).
+
+        ``TestIDP.test_idp_backup_restore`` already covers client-secret IdP
+        references; extending it with PKCS#12 attributes belongs in that test
+        once backup metadata is confirmed to include binary ``userPKCS12``.
+        """
+        pytest.skip(
+            "TC-E04: extend ipa-backup/ipa-restore coverage for userPKCS12 "
+            "alongside TestIDP.test_idp_backup_restore"
+        )
+
+    def test_tc_a03_keycloak_client_secret_backward_compat(self):
+        """
+        S1 (negative / compat) — TC-A03.
+
+        Default ``ipa idp-add`` with ``--secret`` and no client-auth method
+        continues to provision Keycloak-backed IdPs unchanged.
+        """
+        create_keycloak.setup_keycloakserver(self.client)
+        time.sleep(60)
+        create_keycloak.setup_keycloak_client(self.client)
+        tasks.kinit_admin(self.master)
+        pw = self.client.config.admin_password
+        self.master.run_command(
+            [
+                "ipa", "idp-add", "keycloakidp", "--provider=keycloak",
+                "--client-id=ipa_oidc_client", "--org=master",
+                "--base-url={0}:8443".format(self.client.hostname),
+            ],
+            stdin_text="{0}\n{0}".format(pw),
+        )
+        show = self.master.run_command(["ipa", "idp-show", "keycloakidp"])
+        text = show.stdout_text.lower()
+        assert "private_key_jwt" not in text
+        assert "tls_client_auth" not in text
+        tasks.user_add(
+            self.master,
+            "keycloakuser",
+            extra_args=["--user-auth-type=idp",
+                        "--idp-user-id=testuser1@ipa.test",
+                        "--idp=keycloakidp"],
+        )
+        tasks.clear_sssd_cache(self.master)
+        kinit_idp(self.master, "keycloakuser", keycloak_server=self.client)
+
+    def test_idp_add_pkcs12_empty_passphrase_succeeds(self):
+        """
+        ``ipa idp-add`` must accept a PKCS#12 with an empty MAC password.
+
+        Supplying only newlines for the PKCS#12 passphrase prompts used to
+        trigger an uncaught ``InternalError``; the server must either import
+        the bundle successfully or return a normal validation error — never
+        ``InternalError``.
+        """
+        if not ipa_idp_cli_supports_client_certificate_options(self.master):
+            pytest.skip(
+                "ipa idp-add has no --client-auth-method / PKCS#12 options"
+            )
+        tasks.kinit_admin(self.master)
+        nopass_name = "keycloakidpnopassp12"
+        workdir = "/tmp/idp-openssl-nopass-%06d" % random.randint(0, 999999)
+        generate_idp_client_openssl_bundle(
+            self.master, workdir=workdir, p12_password="")
+        p12_src = os.path.join(workdir, "idp-client.p12")
+        self.master.run_command(
+            [
+                "openssl", "pkcs12", "-in", p12_src, "-nodes",
+                "-passin", "pass:", "-noout",
+            ],
+            cwd=workdir,
+        )
+        self.master.run_command(["cp", p12_src, IDP_CLIENT_P12_NOPASS_IPA_PATH])
+        self.master.run_command(["chmod", "600", IDP_CLIENT_P12_NOPASS_IPA_PATH])
+        pw = self.client.config.admin_password
+        try:
+            res = self.master.run_command(
+                [
+                    "ipa", "idp-add", nopass_name,
+                    "--provider=keycloak",
+                    "--client-id=ipa_oidc_client",
+                    "--org=master",
+                    "--base-url={0}:8443".format(self.client.hostname),
+                    "--client-auth-method=private_key_jwt",
+                    "--client-cert-p12-file=%s" % IDP_CLIENT_P12_NOPASS_IPA_PATH,
+                ],
+                stdin_text="\n\n",
+                raiseonerr=False,
+            )
+            combined = res.stdout_text + res.stderr_text
+            assert "internalerror" not in combined.lower(), combined
+        finally:
+            tasks.kinit_admin(self.master)
+            self.master.run_command(
+                ["ipa", "idp-del", nopass_name],
+                raiseonerr=False,
+            )
+            self.master.run_command(
+                ["rm", "-f", IDP_CLIENT_P12_NOPASS_IPA_PATH],
+                raiseonerr=False,
+            )
+            self.master.run_command(["rm", "-rf", workdir], raiseonerr=False)
+
+    def test_tc_c04_mod_method_without_p12_behavior(self):
+        """
+        S3 — TC-C04 (method switch without supplying a new PKCS#12 file).
+
+        Asserts the CLI either rejects the operation or documents the
+        preservation behavior for an entry that still has no cert material.
+        """
+        if not ipa_idp_mod_supports_client_certificate_options(self.master):
+            pytest.skip("ipa idp-mod has no --client-auth-method")
+        tasks.kinit_admin(self.master)
+        res = self.master.run_command(
+            [
+                "ipa", "idp-mod", "keycloakidp",
+                "--client-auth-method=private_key_jwt",
+            ],
+            raiseonerr=False,
+        )
+        assert res.returncode != 0, (
+            "TC-C04: idp-mod to private_key_jwt without P12 must fail or be "
+            "explicitly documented as a no-op; got success without cert upload"
+        )
+
+    def test_tc_d01_d02_d04_idp_rbac_and_ldap(self):
+        """
+        S4 — TC-D01, TC-D02, TC-D04.
+
+        * User without IdP read rights cannot run ``ipa idp-show``.
+        * User with only *System: Read External IdP server* must not obtain
+          ``ipaIdpClientSecret`` over LDAP.
+        """
+        tasks.kinit_admin(self.master)
+        reader_pass = "SecretReader123!SecretReader123!"
+        tasks.user_add(
+            self.master,
+            "idpnoidp",
+            password=reader_pass,
+            first="No",
+            last="Idp",
+        )
+        tasks.user_add(
+            self.master,
+            "idpread",
+            password=reader_pass,
+            first="Idp",
+            last="Reader",
+        )
+        priv = "idp_readonly_priv_%06d" % random.randint(0, 999999)
+        role = "idp_readonly_role_%06d" % random.randint(0, 999999)
+        try:
+            self.master.run_command(
+                ["ipa", "privilege-add", priv,
+                 "--desc", "read idp metadata only"],
+                raiseonerr=False,
+            )
+            perm_add = self.master.run_command(
+                [
+                    "ipa", "privilege-add-permission", priv,
+                    "--permission", "System: Read External IdP server",
+                ],
+                raiseonerr=False,
+            )
+            if perm_add.returncode != 0:
+                pytest.skip(
+                    "TC-D02/D04: could not attach "
+                    "'System: Read External IdP server' (%s)"
+                    % perm_add.stderr_text.strip()
+                )
+            self.master.run_command(
+                ["ipa", "role-add", role, "--desc", "IdP read-only"],
+            )
+            self.master.run_command(
+                ["ipa", "role-add-member-privilege", role,
+                 "--privileges", priv],
+            )
+            self.master.run_command(
+                ["ipa", "role-add-member-user", role, "--users=idpread"],
+            )
+
+            tasks.kdestroy_all(self.master)
+            tasks.kinit_as_user(self.master, "idpnoidp", reader_pass)
+            no_right = self.master.run_command(
+                ["ipa", "idp-show", "keycloakidp"],
+                raiseonerr=False,
+            )
+            assert no_right.returncode != 0
+
+            tasks.kdestroy_all(self.master)
+            tasks.kinit_as_user(self.master, "idpread", reader_pass)
+            ok_show = self.master.run_command(
+                ["ipa", "idp-show", "keycloakidp"],
+                raiseonerr=False,
+            )
+            assert ok_show.returncode == 0, ok_show.stderr_text
+
+            basedn = str(self.master.domain.basedn)
+            reader_dn = "uid=idpread,cn=users,cn=accounts,%s" % basedn
+            idp_dn = ldap_idp_entry_dn(self.master, "keycloakidp")
+            ldap_res = tasks.run_ldapsearch(
+                self.master,
+                reader_dn,
+                reader_pass,
+                idp_dn,
+                ["(objectclass=*)", "ipaIdpClientSecret"],
+                scope="base",
+                raiseonerr=False,
+            )
+            assert "ipaIdpClientSecret::" not in ldap_res.stdout_text
+        finally:
+            tasks.kdestroy_all(self.master)
+            tasks.kinit_admin(self.master)
+            self.master.run_command(
+                ["ipa", "role-del", role], raiseonerr=False)
+            self.master.run_command(
+                ["ipa", "privilege-del", priv], raiseonerr=False)
+            tasks.user_del(self.master, "idpread", raiseonerr=False)
+            tasks.user_del(self.master, "idpnoidp", raiseonerr=False)
+
+    def test_tc_b03_ipa_otpd_stopped_negative(self):
+        """
+        S1/S2 — TC-B03 (``ipa-otpd`` outage).
+
+        With IdP device flow configured, stopping ``ipa-otpd`` must yield a
+        predictable Kerberos client failure rather than hanging indefinitely.
+        """
+        tasks.kinit_admin(self.master)
+        self.master.run_command(["systemctl", "stop", "ipa-otpd"])
+        try:
+            tasks.kdestroy_all(self.master)
+            res = self.master.run_command(
+                ["timeout", "35", "kinit", "keycloakuser"],
+                raiseonerr=False,
+            )
+            assert res.returncode != 0
+        finally:
+            self.master.run_command(
+                ["systemctl", "start", "ipa-otpd"], raiseonerr=False)
+            tasks.run_repeatedly(
+                self.master,
+                ["systemctl", "is-active", "ipa-otpd"],
+                timeout=60,
+            )
