@@ -46,6 +46,8 @@ def selenium_remote_finally(shot_path):
 
 SELENIUM_REMOTE_HEAD = textwrap.dedent(
     """
+    import os
+    import time
     from selenium import webdriver
     from datetime import datetime
     from packaging.version import parse as parse_version
@@ -53,17 +55,29 @@ SELENIUM_REMOTE_HEAD = textwrap.dedent(
     from selenium.webdriver.common.by import By
     from selenium.webdriver.support.ui import WebDriverWait
     from selenium.webdriver.support import expected_conditions as EC
-    import time
-    options = Options()
-    if parse_version(webdriver.__version__) < parse_version('4.10.0'):
-        options.headless = True
-        driver = webdriver.Firefox(
-            executable_path="/opt/geckodriver", options=options)
-    else:
-        options.add_argument('-headless')
-        service = webdriver.FirefoxService(
-            executable_path="/opt/geckodriver")
-        driver = webdriver.Firefox(options=options, service=service)
+
+    os.environ.setdefault("DISPLAY", ":99")
+
+    def _firefox_driver():
+        options = Options()
+        # Keycloak may use KC_HTTPS_CLIENT_AUTH=request for mTLS tests; do not
+        # block headless Firefox on an optional client-cert TLS prompt.
+        options.set_preference(
+            "security.default_personal_cert", "Select Automatically")
+        options.set_capability("acceptInsecureCerts", True)
+        if parse_version(webdriver.__version__) < parse_version('4.10.0'):
+            options.headless = True
+            drv = webdriver.Firefox(
+                executable_path="/opt/geckodriver", options=options)
+        else:
+            options.add_argument('-headless')
+            service = webdriver.FirefoxService(
+                executable_path="/opt/geckodriver")
+            drv = webdriver.Firefox(options=options, service=service)
+        drv.set_page_load_timeout(60)
+        return drv
+
+    driver = _firefox_driver()
 
     """
 ).strip() + "\n\n"
@@ -74,6 +88,15 @@ KEYCLOCK_USER_CODE_BODY = textwrap.dedent(
     verification_uri = "{uri}"
     driver.get(verification_uri)
     try:
+        # Device flow may show a confirmation step before the login form.
+        for _el_id in ("kc-login", "login", "continue"):
+            try:
+                btn = WebDriverWait(driver, 5).until(
+                    EC.element_to_be_clickable((By.ID, _el_id)))
+                btn.click()
+                break
+            except Exception:
+                pass
         element = WebDriverWait(driver, 90).until(
             EC.presence_of_element_located((By.ID, "username")))
         driver.find_element(By.ID, "username").send_keys("testuser1")
@@ -667,6 +690,174 @@ def purge_entra_idp_test_client_certs(
         token, app_object_id, display_name_prefix)
 
 
+def keycloak_truststore_path():
+    return os.path.join(paths.OPENSSL_PRIVATE_DIR, "keycloak.jks")
+
+
+def keycloak_ensure_kcadm_credentials(keycloak_host):
+    """Configure ``kcadm.sh`` admin session on the Keycloak host."""
+    password = keycloak_host.config.admin_password
+    kcadmin_sh = "/opt/keycloak/bin/kcadm.sh"
+    keystore = keycloak_truststore_path()
+    keycloak_host.run_command(
+        [kcadmin_sh, "config", "truststore",
+         "--trustpass", password, keystore])
+    kcadmin = [
+        kcadmin_sh, "config", "credentials", "--server",
+        "https://%s:8443/" % keycloak_host.hostname,
+        "--realm", "master", "--user", "admin",
+        "--password", password,
+    ]
+    tasks.run_repeatedly(keycloak_host, kcadmin, timeout=60)
+
+
+def keycloak_client_internal_id(keycloak_host, client_id, realm="master"):
+    """Return Keycloak internal client UUID for *client_id*, or ``None``."""
+    kcadmin_sh = "/opt/keycloak/bin/kcadm.sh"
+    out = keycloak_host.run_command(
+        [kcadmin_sh, "get", "clients", "-r", realm,
+         "-q", "clientId=%s" % client_id, "--fields", "id"],
+        raiseonerr=False,
+    )
+    if out.returncode != 0:
+        return None
+    clients = json.loads(out.stdout_text or "[]")
+    if not clients:
+        return None
+    return clients[0]["id"]
+
+
+def keycloak_delete_client(keycloak_host, client_id, realm="master"):
+    """Delete an OAuth client by its ``clientId`` (no-op if missing)."""
+    internal_id = keycloak_client_internal_id(
+        keycloak_host, client_id, realm=realm)
+    if internal_id is None:
+        return
+    kcadmin_sh = "/opt/keycloak/bin/kcadm.sh"
+    keycloak_host.run_command(
+        [kcadmin_sh, "delete", "clients/%s" % internal_id, "-r", realm],
+        raiseonerr=False,
+    )
+
+
+def keycloak_pem_cert_der_b64(pem_certificate_bytes):
+    """Base64-encoded DER of a PEM certificate (Keycloak JWT credential)."""
+    if isinstance(pem_certificate_bytes, str):
+        pem_certificate_bytes = pem_certificate_bytes.encode("ascii")
+    cert = x509.load_pem_x509_certificate(pem_certificate_bytes)
+    der = cert.public_bytes(serialization.Encoding.DER)
+    return base64.b64encode(der).decode("ascii")
+
+
+def keycloak_pem_cert_subject_dn(pem_certificate_bytes):
+    """RFC4514 subject DN for Keycloak ``x509.subjectdn`` matching."""
+    if isinstance(pem_certificate_bytes, str):
+        pem_certificate_bytes = pem_certificate_bytes.encode("ascii")
+    cert = x509.load_pem_x509_certificate(pem_certificate_bytes)
+    return cert.subject.rfc4514_string()
+
+
+def keycloak_oidc_client_json(domain_name, client_id, *, auth_method, extra_attrs):
+    """Build Keycloak OIDC client JSON for device authorization grant."""
+    attrs = {
+        "oauth2.device.authorization.grant.enabled": "true",
+        "oauth2.device.polling.interval": "5",
+    }
+    attrs.update(extra_attrs)
+    if auth_method == "private_key_jwt":
+        authenticator = "client-jwt"
+    elif auth_method == "tls_client_auth":
+        authenticator = "client-x509"
+    else:
+        raise ValueError("unsupported auth_method: %s" % auth_method)
+    return {
+        "enabled": True,
+        "clientId": client_id,
+        "protocol": "openid-connect",
+        "clientAuthenticatorType": authenticator,
+        "redirectUris": ["https://ipa-ca.%s/ipa/idp/*" % domain_name],
+        "webOrigins": ["https://ipa-ca.%s" % domain_name],
+        "attributes": attrs,
+    }
+
+
+def keycloak_create_cert_oidc_client(
+    keycloak_host,
+    domain_name,
+    client_id,
+    *,
+    auth_method,
+    extra_attrs,
+    realm="master",
+):
+    """
+    Create a confidential Keycloak client for JWT or mTLS client auth.
+
+    Follows the setup used in SSSD ``test_oidc_child`` (PR #8708).
+    """
+    client_def = keycloak_oidc_client_json(
+        domain_name, client_id,
+        auth_method=auth_method, extra_attrs=extra_attrs)
+    json_path = "/tmp/%s_client.json" % client_id
+    keycloak_host.put_file_contents(json_path, json.dumps(client_def))
+    kcadmin_sh = "/opt/keycloak/bin/kcadm.sh"
+    keycloak_host.run_command(
+        [kcadmin_sh, "create", "clients", "-r", realm, "-f", json_path],
+    )
+
+
+def keycloak_truststore_import_cert(keycloak_host, crt_path, alias):
+    """Import a client certificate into Keycloak's HTTPS truststore."""
+    password = keycloak_host.config.admin_password
+    keystore = keycloak_truststore_path()
+    keycloak_host.run_command([
+        "keytool", "-storepass", password,
+        "-keystore", keystore, "-noprompt",
+        "-importcert", "-file", crt_path, "-alias", alias,
+    ])
+
+
+def keycloak_truststore_delete_cert(keycloak_host, alias):
+    """Remove *alias* from Keycloak's HTTPS truststore (no-op if missing)."""
+    password = keycloak_host.config.admin_password
+    keystore = keycloak_truststore_path()
+    keycloak_host.run_command([
+        "keytool", "-storepass", password,
+        "-keystore", keystore, "-delete", "-alias", alias, "-noprompt",
+    ], raiseonerr=False)
+
+
+def keycloak_set_https_client_auth(keycloak_host, mode):
+    """
+    Set ``KC_HTTPS_CLIENT_AUTH`` and restart Keycloak.
+
+    Use ``none`` for browser/device-flow tests and ``request`` only while
+    exercising RFC 8705 ``tls_client_auth`` at the token endpoint.
+    """
+    if mode not in ("none", "request", "required"):
+        raise ValueError("unsupported KC_HTTPS_CLIENT_AUTH: %s" % mode)
+    sysconfig_path = "/etc/sysconfig/keycloak"
+    content = keycloak_host.get_file_contents(
+        sysconfig_path, encoding="utf-8")
+    lines = []
+    found = False
+    for line in content.splitlines():
+        if line.startswith("KC_HTTPS_CLIENT_AUTH="):
+            lines.append("KC_HTTPS_CLIENT_AUTH=%s" % mode)
+            found = True
+        else:
+            lines.append(line)
+    if not found:
+        lines.append("KC_HTTPS_CLIENT_AUTH=%s" % mode)
+    keycloak_host.put_file_contents(sysconfig_path, "\n".join(lines) + "\n")
+    keycloak_host.run_command(["systemctl", "restart", "keycloak"])
+    tasks.run_repeatedly(
+        keycloak_host,
+        ["systemctl", "is-active", "keycloak"],
+        timeout=120,
+    )
+
+
 class TestIDP(IntegrationTest):
     """Common IdP integration test setup and helpers."""
 
@@ -710,7 +901,11 @@ class TestIDP(IntegrationTest):
         path = "/tmp/%s" % remote_basename
         try:
             host.put_file_contents(path, script)
-            tasks.run_repeatedly(host, ["python3", path], timeout=timeout)
+            tasks.run_repeatedly(
+                host,
+                ["timeout", "--signal=TERM", "120", "python3", path],
+                timeout=max(timeout, 150),
+            )
         finally:
             host.run_command(["rm", "-f", path])
 
@@ -780,6 +975,23 @@ class TestIDPKeycloak(TestIDP):
     KEYCLOAK_IDP_NAME = "keycloakidp"
     KEYCLOAK_USER = "keycloakuser"
     KEYCLOAK_IDP_USER_ID = "testuser1@ipa.test"
+    KEYCLOAK_JWT_IDP_NAME = "keycloakjwtidp"
+    KEYCLOAK_TLS_IDP_NAME = "keycloaktlsidp"
+    KEYCLOAK_JWT_USER = "keycloakjwtuser"
+    KEYCLOAK_TLS_USER = "keycloaktlsuser"
+    KEYCLOAK_JWT_CLIENT_ID = "ipa_oidc_jwt_client"
+    KEYCLOAK_TLS_CLIENT_ID = "ipa_oidc_tls_client"
+    KEYCLOAK_MTLS_TRUSTSTORE_ALIAS = "idp-client-mtls"
+
+    def _ensure_keycloak_for_cert_tests(self):
+        """Ensure Keycloak is running and ``kcadm`` is authenticated."""
+        result = self.client.run_command(
+            ["systemctl", "is-active", "keycloak"], raiseonerr=False)
+        if result.returncode != 0:
+            create_keycloak.setup_keycloakserver(self.client)
+            time.sleep(60)
+            create_keycloak.setup_keycloak_client(self.client)
+        keycloak_ensure_kcadm_credentials(self.client)
 
     @staticmethod
     def add_keycloak_user_code(host, verification_uri):
@@ -796,7 +1008,6 @@ class TestIDPKeycloak(TestIDP):
         Authorization Grant is working as
         expected for user configured with external idp.
         """
-        pytest.skip()
         create_keycloak.setup_keycloakserver(self.client)
         time.sleep(60)
         create_keycloak.setup_keycloak_client(self.client)
@@ -829,7 +1040,6 @@ class TestIDPKeycloak(TestIDP):
     @pytest.fixture
     def hbac_setup_teardown(self):
         # allow sshd only on given host
-        pytest.skip()
         tasks.kinit_admin(self.master)
         self.master.run_command(["ipa", "hbacrule-disable", "allow_all"])
         self.master.run_command(["ipa", "hbacrule-add", "rule1"])
@@ -855,7 +1065,6 @@ class TestIDPKeycloak(TestIDP):
         Test case to check that hbacrule is working as
         expected for user configured with external idp.
         """
-        pytest.skip()
         self.kinit_idp(self.master, 'keycloakuser', keycloak_server=self.client)
         ssh_cmd = "ssh -q -K -l keycloakuser {0} whoami"
         valid_ssh = self.master.run_command(
@@ -871,7 +1080,6 @@ class TestIDPKeycloak(TestIDP):
         Test case to check that sudorule is working as
         expected for user configured with external idp.
         """
-        pytest.skip()
         tasks.kdestroy_all(self.master)
         tasks.kinit_admin(self.master)
         #  rule: keycloakuser are allowed to execute yum on
@@ -916,7 +1124,6 @@ class TestIDPKeycloak(TestIDP):
         Test case to check that OAuth 2.0 Device
         Authorization is working as expected on replica.
         """
-        pytest.skip()
         tasks.clear_sssd_cache(self.master)
         tasks.clear_sssd_cache(self.replica)
         tasks.kinit_admin(self.replica)
@@ -939,7 +1146,6 @@ class TestIDPKeycloak(TestIDP):
         Test case to check that services can be configured
         auth indicator as idp.
         """
-        pytest.skip()
         tasks.clear_sssd_cache(self.master)
         tasks.kinit_admin(self.master)
         domain = self.master.domain.name.upper()
@@ -965,7 +1171,6 @@ class TestIDPKeycloak(TestIDP):
         Test case to check that after restore data is retrieved
         with related idp configuration.
         """
-        pytest.skip()
         tasks.kinit_admin(self.master)
         user = "backupuser"
         cmd = ["ipa", "idp-add", "testidp", "--provider=keycloak",
@@ -1003,6 +1208,260 @@ class TestIDPKeycloak(TestIDP):
             tasks.kinit_admin(self.master)
             self.master.run_command(["rm", "-rf", backup_path])
             self.master.run_command(["ipa", "idp-del", "testidp"])
+
+    def test_idp_jwt_keycloak(self):
+        """
+        Test CERT keycloak private_key_jwt certificate authorization grant.
+
+        Generate client certificate material with openssl on the IPA master,
+        upload ``idp-client.crt`` to the keycloak used for IdP
+        and run ``ipa idp-add`` for JWT client
+        auth (``private_key_jwt``) against keycloak.
+        """
+        self._ensure_keycloak_for_cert_tests()
+
+        workdir = generate_idp_client_openssl_bundle(self.master)
+        crt_path = os.path.join(workdir, "idp-client.crt")
+        pem_bytes = self.master.get_file_contents(crt_path)
+        cert_b64 = keycloak_pem_cert_der_b64(pem_bytes)
+
+        kc_client_added = False
+        p12_on_master = False
+        jwt_idp_added = False
+        jwt_user_added = False
+        try:
+            keycloak_delete_client(self.client, self.KEYCLOAK_JWT_CLIENT_ID)
+            keycloak_create_cert_oidc_client(
+                self.client,
+                self.master.domain.name,
+                self.KEYCLOAK_JWT_CLIENT_ID,
+                auth_method="private_key_jwt",
+                extra_attrs={"jwt.credential.certificate": cert_b64},
+            )
+            kc_client_added = True
+
+            p12_src = os.path.join(workdir, "idp-client.p12")
+            self.master.run_command(
+                ["cp", p12_src, IDP_CLIENT_P12_IPA_PATH])
+            self.master.run_command(
+                ["chmod", "600", IDP_CLIENT_P12_IPA_PATH])
+            p12_on_master = True
+
+            tasks.kinit_admin(self.master)
+            since = time.strftime(
+                '%Y-%m-%d %H:%M:%S',
+                (datetime.now() - timedelta(seconds=10)).timetuple(),
+            )
+            idp_add_cmd = [
+                "ipa", "idp-add", self.KEYCLOAK_JWT_IDP_NAME,
+                "--provider=keycloak",
+                "--org=master",
+                "--base-url=%s:8443" % self.client.hostname,
+                "--client-id=%s" % self.KEYCLOAK_JWT_CLIENT_ID,
+                "--client-auth-method=private_key_jwt",
+                "--client-cert-p12-file=%s" % IDP_CLIENT_P12_IPA_PATH,
+            ]
+            self.master.run_command(
+                idp_add_cmd, stdin_text=p12_passphrase_stdin())
+            show_out = self.master.run_command(
+                ["ipa", "idp-show", self.KEYCLOAK_JWT_IDP_NAME, "--all"])
+            assert "private_key_jwt" in show_out.stdout_text.lower()
+            journal = self.master.run_command(
+                ["journalctl", "-g", "IPA.API", "--since=%s" % since])
+            assert '"userpkcs12": "********"' in journal.stdout_text
+            jwt_idp_added = True
+
+            tasks.user_add(
+                self.master,
+                self.KEYCLOAK_JWT_USER,
+                first="keycloakjwt",
+                last="UserJwt",
+                extra_args=[
+                    "--user-auth-type=idp",
+                    "--idp-user-id=" + self.KEYCLOAK_IDP_USER_ID,
+                    "--idp=" + self.KEYCLOAK_JWT_IDP_NAME,
+                ],
+            )
+            jwt_user_added = True
+            tasks.clear_sssd_cache(self.master)
+            tasks.wait_for_sssd_domain_status_online(self.master)
+            wait_for_ipa_user_lookup_id(self.master, self.KEYCLOAK_JWT_USER)
+            since = time.strftime(
+                '%Y-%m-%d %H:%M:%S',
+                (datetime.now() - timedelta(seconds=30)).timetuple(),
+            )
+            self.kinit_idp(
+                self.master,
+                self.KEYCLOAK_JWT_USER,
+                keycloak_server=self.client,
+            )
+            test_idp = self.master.run_command(["klist", "-C"])
+            assert "152" in test_idp.stdout_text
+            journal = self.master.run_command(
+                ["journalctl", "-u", "ipa-otpd", "--since=%s" % since],
+                raiseonerr=False,
+            )
+            text = (journal.stdout_text + journal.stderr_text).lower()
+            jwt_markers = (
+                "client_assertion",
+                "private_key_jwt",
+                "jwt-bearer",
+                "client-assertion-type",
+            )
+            assert any(marker in text for marker in jwt_markers)
+        finally:
+            if kc_client_added:
+                keycloak_delete_client(self.client, self.KEYCLOAK_JWT_CLIENT_ID)
+            if jwt_idp_added:
+                tasks.kinit_admin(self.master)
+                self.master.run_command(
+                    ["ipa", "idp-del", self.KEYCLOAK_JWT_IDP_NAME],
+                    raiseonerr=False,
+                )
+            if jwt_user_added:
+                tasks.kinit_admin(self.master)
+                self.master.run_command(
+                    ["ipa", "user-del", self.KEYCLOAK_JWT_USER],
+                    raiseonerr=False,
+                )
+            if p12_on_master:
+                self.master.run_command(
+                    ["rm", "-f", IDP_CLIENT_P12_IPA_PATH],
+                    raiseonerr=False,
+                )
+            self.master.run_command(
+                ["rm", "-rf", workdir], raiseonerr=False)
+
+    def test_idp_tls_keycloak(self):
+        """
+        Test CERT keycloak tls_client_auth certificate authorization grant.
+
+        Generate client certificate material with openssl on the IPA master,
+        upload ``idp-client.crt`` to the keycloak used for IdP
+        and run ``ipa idp-add`` for TLS client
+        auth (``tls_client_auth``) against keycloak.
+        """
+        self._ensure_keycloak_for_cert_tests()
+
+        workdir = generate_idp_client_openssl_bundle(self.master)
+        crt_path = os.path.join(workdir, "idp-client.crt")
+        pem_bytes = self.master.get_file_contents(crt_path)
+        subject_dn = keycloak_pem_cert_subject_dn(pem_bytes)
+        crt_on_keycloak = "/tmp/idp-client.crt"
+
+        kc_client_added = False
+        truststore_imported = False
+        https_client_auth_enabled = False
+        p12_on_master = False
+        tls_idp_added = False
+        tls_user_added = False
+        try:
+            pem_text = (
+                pem_bytes.decode("ascii")
+                if isinstance(pem_bytes, bytes) else pem_bytes
+            )
+            self.client.put_file_contents(crt_on_keycloak, pem_text)
+            keycloak_set_https_client_auth(self.client, "request")
+            https_client_auth_enabled = True
+            keycloak_truststore_delete_cert(
+                self.client, self.KEYCLOAK_MTLS_TRUSTSTORE_ALIAS)
+            keycloak_truststore_import_cert(
+                self.client, crt_on_keycloak, self.KEYCLOAK_MTLS_TRUSTSTORE_ALIAS)
+            truststore_imported = True
+            keycloak_ensure_kcadm_credentials(self.client)
+
+            keycloak_delete_client(self.client, self.KEYCLOAK_TLS_CLIENT_ID)
+            keycloak_create_cert_oidc_client(
+                self.client,
+                self.master.domain.name,
+                self.KEYCLOAK_TLS_CLIENT_ID,
+                auth_method="tls_client_auth",
+                extra_attrs={"x509.subjectdn": subject_dn},
+            )
+            kc_client_added = True
+
+            p12_src = os.path.join(workdir, "idp-client.p12")
+            self.master.run_command(
+                ["cp", p12_src, IDP_CLIENT_TLS_P12_IPA_PATH])
+            self.master.run_command(
+                ["chmod", "600", IDP_CLIENT_TLS_P12_IPA_PATH])
+            p12_on_master = True
+
+            tasks.kinit_admin(self.master)
+            since = time.strftime(
+                '%Y-%m-%d %H:%M:%S',
+                (datetime.now() - timedelta(seconds=10)).timetuple(),
+            )
+            idp_add_cmd = [
+                "ipa", "idp-add", self.KEYCLOAK_TLS_IDP_NAME,
+                "--provider=keycloak",
+                "--org=master",
+                "--base-url=%s:8443" % self.client.hostname,
+                "--client-id=%s" % self.KEYCLOAK_TLS_CLIENT_ID,
+                "--client-auth-method=tls_client_auth",
+                "--client-cert-p12-file=%s" % IDP_CLIENT_TLS_P12_IPA_PATH,
+            ]
+            self.master.run_command(
+                idp_add_cmd, stdin_text=p12_passphrase_stdin())
+            journal = self.master.run_command(
+                ["journalctl", "-g", "IPA.API", "--since=%s" % since])
+            assert '"userpkcs12": "********"' in journal.stdout_text
+            show_out = self.master.run_command(
+                ["ipa", "idp-show", self.KEYCLOAK_TLS_IDP_NAME, "--all"])
+            assert "tls_client_auth" in show_out.stdout_text.lower()
+            tls_idp_added = True
+
+            tasks.user_add(
+                self.master,
+                self.KEYCLOAK_TLS_USER,
+                first="keycloaktls",
+                last="UserTls",
+                extra_args=[
+                    "--user-auth-type=idp",
+                    "--idp-user-id=" + self.KEYCLOAK_IDP_USER_ID,
+                    "--idp=" + self.KEYCLOAK_TLS_IDP_NAME,
+                ],
+            )
+            tls_user_added = True
+            tasks.clear_sssd_cache(self.master)
+            tasks.wait_for_sssd_domain_status_online(self.master)
+            wait_for_ipa_user_lookup_id(self.master, self.KEYCLOAK_TLS_USER)
+            self.kinit_idp(
+                self.master,
+                self.KEYCLOAK_TLS_USER,
+                keycloak_server=self.client,
+            )
+            test_idp = self.master.run_command(["klist", "-C"])
+            assert "152" in test_idp.stdout_text
+        finally:
+            if kc_client_added:
+                keycloak_delete_client(self.client, self.KEYCLOAK_TLS_CLIENT_ID)
+            if truststore_imported:
+                keycloak_truststore_delete_cert(
+                    self.client, self.KEYCLOAK_MTLS_TRUSTSTORE_ALIAS)
+            if https_client_auth_enabled:
+                keycloak_set_https_client_auth(self.client, "none")
+            if tls_idp_added:
+                tasks.kinit_admin(self.master)
+                self.master.run_command(
+                    ["ipa", "idp-del", self.KEYCLOAK_TLS_IDP_NAME],
+                    raiseonerr=False,
+                )
+            if tls_user_added:
+                tasks.kinit_admin(self.master)
+                self.master.run_command(
+                    ["ipa", "user-del", self.KEYCLOAK_TLS_USER],
+                    raiseonerr=False,
+                )
+            if p12_on_master:
+                self.master.run_command(
+                    ["rm", "-f", IDP_CLIENT_TLS_P12_IPA_PATH],
+                    raiseonerr=False,
+                )
+            self.client.run_command(
+                ["rm", "-f", crt_on_keycloak], raiseonerr=False)
+            self.master.run_command(
+                ["rm", "-rf", workdir], raiseonerr=False)
 
 
 class TestIDPCLI(IntegrationTest):

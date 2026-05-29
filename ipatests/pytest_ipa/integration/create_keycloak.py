@@ -60,6 +60,7 @@ def setup_keycloakserver(host, version='26.4.4'):
     KC_HTTPS_CERTIFICATE_KEY_FILE={key}
     KC_HTTPS_TRUST_STORE_FILE={store}
     KC_HTTPS_TRUST_STORE_PASSWORD={store_pswd}
+    KC_HTTPS_CLIENT_AUTH=none
     """).format(admin_pswd=password, host=host.hostname, crt=crt, key=key,
                 store=keystore, store_pswd=password)
     host.put_file_contents("/etc/sysconfig/keycloak", contents)
@@ -94,6 +95,7 @@ def setup_keycloakserver(host, version='26.4.4'):
     export KC_HTTPS_TRUST_STORE_FILE=/etc/pki/tls/private/keycloak.jks
     export KC_HTTPS_TRUST_STORE_PASSWORD={STORE_PASS}
     export KC_BOOTSTRAP_ADMIN_PASSWORD={ADMIN_PASS}
+    export KC_HTTPS_CLIENT_AUTH=none
     """).format(hostname=host.hostname, STORE_PASS=password,
                 ADMIN_PASS=password)
 
@@ -105,7 +107,7 @@ def setup_keycloakserver(host, version='26.4.4'):
     host.run_command(['bash'])
     host.run_command(
         ['su', '-', 'keycloak', '-c', '/opt/keycloak/bin/kc.sh build'])
-    host.run_command(["systemctl", "start", "keycloak"])
+    host.run_command(["systemctl", "restart", "keycloak"])
     host.run_command(["/opt/keycloak/bin/kc.sh", "show-config"])
 
     # Setup keycloak for use:
