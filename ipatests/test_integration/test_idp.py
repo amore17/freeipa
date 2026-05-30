@@ -47,7 +47,6 @@ def selenium_remote_finally(shot_path):
 SELENIUM_REMOTE_HEAD = textwrap.dedent(
     """
     import os
-    import time
     from selenium import webdriver
     from datetime import datetime
     from packaging.version import parse as parse_version
@@ -55,29 +54,20 @@ SELENIUM_REMOTE_HEAD = textwrap.dedent(
     from selenium.webdriver.common.by import By
     from selenium.webdriver.support.ui import WebDriverWait
     from selenium.webdriver.support import expected_conditions as EC
+    import time
 
     os.environ.setdefault("DISPLAY", ":99")
-
-    def _firefox_driver():
-        options = Options()
-        # Keycloak may use KC_HTTPS_CLIENT_AUTH=request for mTLS tests; do not
-        # block headless Firefox on an optional client-cert TLS prompt.
-        options.set_preference(
-            "security.default_personal_cert", "Select Automatically")
-        options.set_capability("acceptInsecureCerts", True)
-        if parse_version(webdriver.__version__) < parse_version('4.10.0'):
-            options.headless = True
-            drv = webdriver.Firefox(
-                executable_path="/opt/geckodriver", options=options)
-        else:
-            options.add_argument('-headless')
-            service = webdriver.FirefoxService(
-                executable_path="/opt/geckodriver")
-            drv = webdriver.Firefox(options=options, service=service)
-        drv.set_page_load_timeout(60)
-        return drv
-
-    driver = _firefox_driver()
+    options = Options()
+    if parse_version(webdriver.__version__) < parse_version('4.10.0'):
+        options.headless = True
+        driver = webdriver.Firefox(
+            executable_path="/opt/geckodriver", options=options)
+    else:
+        options.add_argument('-headless')
+        service = webdriver.FirefoxService(
+            executable_path="/opt/geckodriver")
+        driver = webdriver.Firefox(options=options, service=service)
+    driver.set_page_load_timeout(90)
 
     """
 ).strip() + "\n\n"
@@ -88,15 +78,6 @@ KEYCLOCK_USER_CODE_BODY = textwrap.dedent(
     verification_uri = "{uri}"
     driver.get(verification_uri)
     try:
-        # Device flow may show a confirmation step before the login form.
-        for _el_id in ("kc-login", "login", "continue"):
-            try:
-                btn = WebDriverWait(driver, 5).until(
-                    EC.element_to_be_clickable((By.ID, _el_id)))
-                btn.click()
-                break
-            except Exception:
-                pass
         element = WebDriverWait(driver, 90).until(
             EC.presence_of_element_located((By.ID, "username")))
         driver.find_element(By.ID, "username").send_keys("testuser1")
@@ -757,6 +738,16 @@ def keycloak_pem_cert_subject_dn(pem_certificate_bytes):
     return cert.subject.rfc4514_string()
 
 
+def keycloak_openssl_cert_subject_dn(host, crt_path):
+    """Subject DN as reported by ``openssl x509 -subject`` (Keycloak format)."""
+    out = host.run_command(
+        ["openssl", "x509", "-in", crt_path, "-noout", "-subject"])
+    subject = out.stdout_text.strip()
+    if subject.lower().startswith("subject="):
+        subject = subject.split("=", 1)[1].strip()
+    return subject
+
+
 def keycloak_oidc_client_json(domain_name, client_id, *, auth_method, extra_attrs):
     """Build Keycloak OIDC client JSON for device authorization grant."""
     attrs = {
@@ -831,8 +822,9 @@ def keycloak_set_https_client_auth(keycloak_host, mode):
     """
     Set ``KC_HTTPS_CLIENT_AUTH`` and restart Keycloak.
 
-    Use ``none`` for browser/device-flow tests and ``request`` only while
-    exercising RFC 8705 ``tls_client_auth`` at the token endpoint.
+    Use ``none`` for secret-based IdP tests (browser device flow without
+    mTLS).  Use ``request`` for RFC 8705 ``tls_client_auth`` tests so
+    Keycloak accepts the client certificate at the token endpoint.
     """
     if mode not in ("none", "request", "required"):
         raise ValueError("unsupported KC_HTTPS_CLIENT_AUTH: %s" % mode)
@@ -850,12 +842,29 @@ def keycloak_set_https_client_auth(keycloak_host, mode):
     if not found:
         lines.append("KC_HTTPS_CLIENT_AUTH=%s" % mode)
     keycloak_host.put_file_contents(sysconfig_path, "\n".join(lines) + "\n")
+
+    bashrc_path = "/etc/bashrc"
+    bashrc = keycloak_host.get_file_contents(bashrc_path, encoding="utf-8")
+    new_bashrc = re.sub(
+        r"^export KC_HTTPS_CLIENT_AUTH=.*$",
+        "export KC_HTTPS_CLIENT_AUTH=%s" % mode,
+        bashrc,
+        flags=re.MULTILINE,
+    )
+    if new_bashrc != bashrc:
+        keycloak_host.put_file_contents(bashrc_path, new_bashrc)
+
     keycloak_host.run_command(["systemctl", "restart", "keycloak"])
     tasks.run_repeatedly(
         keycloak_host,
         ["systemctl", "is-active", "keycloak"],
         timeout=120,
     )
+    keycloak_host.run_command([
+        "bash", "-c",
+        "unset KC_HTTPS_CLIENT_AUTH; set -a; . %s; set +a; "
+        "/opt/keycloak/bin/kc.sh show-config" % sysconfig_path,
+    ])
 
 
 class TestIDP(IntegrationTest):
@@ -897,17 +906,38 @@ class TestIDP(IntegrationTest):
         return uri, (user_code.strip() if user_code else None)
 
     @staticmethod
-    def run_remote_selenium(host, script, remote_basename, timeout=30):
+    def run_remote_selenium(host, script, remote_basename, timeout=120):
         path = "/tmp/%s" % remote_basename
         try:
             host.put_file_contents(path, script)
-            tasks.run_repeatedly(
-                host,
-                ["timeout", "--signal=TERM", "120", "python3", path],
-                timeout=max(timeout, 150),
+            host.run_command(
+                ["timeout", "--signal=TERM", str(timeout), "python3", path],
+                raiseonerr=True,
             )
         finally:
             host.run_command(["rm", "-f", path])
+
+    def _kinit_idp_keycloak_mtls(self, host, user):
+        """
+        ``kinit`` for ``tls_client_auth`` with Keycloak HTTPS client auth
+        in ``request`` mode before the device flow and token exchange.
+        """
+        keycloak_set_https_client_auth(self.client, "request")
+        ARMOR = "/tmp/armor"
+        tasks.kdestroy_all(host)
+        host.run_command(["kinit", "-n", "-c", ARMOR])
+        cmd = ["kinit", "-T", ARMOR, user]
+        with host.spawn_expect(cmd, default_timeout=120) as e:
+            e.expect(DEVICE_AUTH_PROMPT_RE)
+            prompt = e.get_last_output()
+            uri, device_user_code = TestIDP.parse_device_auth_prompt(prompt)
+            time.sleep(5)
+            self.add_keycloak_user_code(self.client, uri)
+            time.sleep(5)
+            e.sendline('\n')
+            e.expect_exit()
+        test_idp = host.run_command(["klist", "-C"])
+        assert "152" in test_idp.stdout_text
 
     @staticmethod
     def kinit_idp(
@@ -982,6 +1012,10 @@ class TestIDPKeycloak(TestIDP):
     KEYCLOAK_JWT_CLIENT_ID = "ipa_oidc_jwt_client"
     KEYCLOAK_TLS_CLIENT_ID = "ipa_oidc_tls_client"
     KEYCLOAK_MTLS_TRUSTSTORE_ALIAS = "idp-client-mtls"
+    XFAIL_SSSD_OIDC_CERT_AUTH = (
+        "SSSD PR #8708: oidc_child private_key_jwt client auth "
+        "https://github.com/SSSD/sssd/pull/8708"
+    )
 
     def _ensure_keycloak_for_cert_tests(self):
         """Ensure Keycloak is running and ``kcadm`` is authenticated."""
@@ -1209,6 +1243,7 @@ class TestIDPKeycloak(TestIDP):
             self.master.run_command(["rm", "-rf", backup_path])
             self.master.run_command(["ipa", "idp-del", "testidp"])
 
+    @pytest.mark.xfail(reason=XFAIL_SSSD_OIDC_CERT_AUTH, strict=True)
     def test_idp_jwt_keycloak(self):
         """
         Test CERT keycloak private_key_jwt certificate authorization grant.
@@ -1346,12 +1381,11 @@ class TestIDPKeycloak(TestIDP):
         workdir = generate_idp_client_openssl_bundle(self.master)
         crt_path = os.path.join(workdir, "idp-client.crt")
         pem_bytes = self.master.get_file_contents(crt_path)
-        subject_dn = keycloak_pem_cert_subject_dn(pem_bytes)
+        subject_dn = keycloak_openssl_cert_subject_dn(self.master, crt_path)
         crt_on_keycloak = "/tmp/idp-client.crt"
 
         kc_client_added = False
         truststore_imported = False
-        https_client_auth_enabled = False
         p12_on_master = False
         tls_idp_added = False
         tls_user_added = False
@@ -1362,7 +1396,6 @@ class TestIDPKeycloak(TestIDP):
             )
             self.client.put_file_contents(crt_on_keycloak, pem_text)
             keycloak_set_https_client_auth(self.client, "request")
-            https_client_auth_enabled = True
             keycloak_truststore_delete_cert(
                 self.client, self.KEYCLOAK_MTLS_TRUSTSTORE_ALIAS)
             keycloak_truststore_import_cert(
@@ -1426,21 +1459,15 @@ class TestIDPKeycloak(TestIDP):
             tasks.clear_sssd_cache(self.master)
             tasks.wait_for_sssd_domain_status_online(self.master)
             wait_for_ipa_user_lookup_id(self.master, self.KEYCLOAK_TLS_USER)
-            self.kinit_idp(
-                self.master,
-                self.KEYCLOAK_TLS_USER,
-                keycloak_server=self.client,
-            )
-            test_idp = self.master.run_command(["klist", "-C"])
-            assert "152" in test_idp.stdout_text
+            self._kinit_idp_keycloak_mtls(
+                self.master, self.KEYCLOAK_TLS_USER)
         finally:
             if kc_client_added:
                 keycloak_delete_client(self.client, self.KEYCLOAK_TLS_CLIENT_ID)
             if truststore_imported:
                 keycloak_truststore_delete_cert(
                     self.client, self.KEYCLOAK_MTLS_TRUSTSTORE_ALIAS)
-            if https_client_auth_enabled:
-                keycloak_set_https_client_auth(self.client, "none")
+            keycloak_set_https_client_auth(self.client, "none")
             if tls_idp_added:
                 tasks.kinit_admin(self.master)
                 self.master.run_command(
