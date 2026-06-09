@@ -232,13 +232,20 @@ class TestIDP(IntegrationTest):
         path = "/tmp/%s" % remote_basename
         try:
             host.put_file_contents(path, script)
-            tasks.run_repeatedly(host, ["python3", path], timeout=timeout)
+            # run_repeatedly only times out between attempts; wrap the
+            # script so a hung browser cannot block the test indefinitely.
+            cmd = [
+                "timeout", "--kill-after=15", str(timeout),
+                "python3", path,
+            ]
+            tasks.run_repeatedly(host, cmd, timeout=timeout + 30)
         finally:
             host.run_command(["rm", "-f", path])
 
     @staticmethod
     def kinit_idp_device_flow(
         host, user, complete_device_auth, *, pre_complete_delay=15,
+        expect_timeout=100,
     ):
         """
         kinit for users with --user-auth-type=idp: complete OAuth2 device
@@ -249,7 +256,7 @@ class TestIDP(IntegrationTest):
         host.run_command(["kinit", "-n", "-c", armor])
         cmd = ["kinit", "-T", armor, user]
 
-        with host.spawn_expect(cmd, default_timeout=100) as e:
+        with host.spawn_expect(cmd, default_timeout=expect_timeout) as e:
             e.expect(DEVICE_AUTH_PROMPT_RE)
             prompt = e.get_last_output()
             uri, device_user_code = TestIDP.parse_device_auth_prompt(prompt)
@@ -673,13 +680,20 @@ class TestIDPKeycloak(TestIDP):
     def _kinit_idp_keycloak_mtls(self, host, user):
         """
         ``kinit`` for ``tls_client_auth`` with Keycloak HTTPS client auth
-        in ``request`` mode before the device flow and token exchange.
+        in ``request`` mode for the token exchange only.
+
+        Device-flow Selenium must run while ``KC_HTTPS_CLIENT_AUTH=none``;
+        otherwise headless Firefox hangs on the TLS client-cert prompt.
         """
         def complete(uri, _device_user_code):
             TestIDPKeycloak.add_keycloak_user_code(self.client, uri)
+            keycloak_set_https_client_auth(self.client, "request")
 
         TestIDP.kinit_idp_device_flow(
-            host, user, complete, pre_complete_delay=5)
+            host, user, complete,
+            pre_complete_delay=5,
+            expect_timeout=300,
+        )
 
     @pytest.mark.xfail(reason=XFAIL_SSSD_OIDC_CERT_AUTH, strict=True)
     def test_idp_jwt_keycloak(self):
@@ -833,7 +847,6 @@ class TestIDPKeycloak(TestIDP):
                 if isinstance(pem_bytes, bytes) else pem_bytes
             )
             self.client.put_file_contents(crt_on_keycloak, pem_text)
-            keycloak_set_https_client_auth(self.client, "request")
             keycloak_truststore_delete_cert(
                 self.client, self.KEYCLOAK_MTLS_TRUSTSTORE_ALIAS)
             keycloak_truststore_import_cert(
