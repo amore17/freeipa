@@ -298,6 +298,26 @@ def p12_passphrase_stdin(password=IDP_CLIENT_P12_PASSWORD):
     return "%s\n%s\n" % (password, password)
 
 
+def idp_oauth_journal_text(host, since):
+    """Collect ipa-otpd and oidc_child journal output since *since*."""
+    journal = host.run_command(
+        ["journalctl", "--since=%s" % since,
+         "-u", "ipa-otpd", "-t", "oidc_child", "--no-pager"],
+        raiseonerr=False,
+    )
+    return (journal.stdout_text + journal.stderr_text).lower()
+
+
+def keycloak_wait_https_ready(keycloak_host, timeout=120):
+    """Wait until Keycloak answers on its HTTPS port."""
+    url = "https://%s:8443/" % keycloak_host.hostname
+    tasks.run_repeatedly(
+        keycloak_host,
+        ["curl", "-k", "-sf", url],
+        timeout=timeout,
+    )
+
+
 def generate_idp_client_openssl_bundle(
     host,
     workdir=IDP_CLIENT_OPENSSL_WORKDIR,
@@ -865,6 +885,7 @@ def keycloak_set_https_client_auth(keycloak_host, mode):
         "unset KC_HTTPS_CLIENT_AUTH; set -a; . %s; set +a; "
         "/opt/keycloak/bin/kc.sh show-config" % sysconfig_path,
     ])
+    keycloak_wait_https_ready(keycloak_host)
 
 
 class TestIDP(IntegrationTest):
@@ -904,6 +925,13 @@ class TestIDP(IntegrationTest):
         user_code = match.group(1)
         uri = match.group(2).strip()
         return uri, (user_code.strip() if user_code else None)
+
+    @staticmethod
+    def prepare_idp_kinit_host(host, user):
+        """Clear SSSD cache and wait until *user* resolves on *host*."""
+        tasks.clear_sssd_cache(host)
+        tasks.wait_for_sssd_domain_status_online(host)
+        wait_for_ipa_user_lookup_id(host, user)
 
     @staticmethod
     def run_remote_selenium(host, script, remote_basename, timeout=120):
@@ -1048,8 +1076,9 @@ class TestIDPKeycloak(TestIDP):
         tasks.kinit_admin(self.master)
         cmd = ["ipa", "idp-add", "keycloakidp", "--provider=keycloak",
                "--client-id=ipa_oidc_client", "--org=master",
-               "--base-url={0}:8443".format(self.client.hostname)]
-        self.master.run_command(cmd, stdin_text="{0}\n{0}".format(
+               "--base-url={0}:8443".format(self.client.hostname),
+               "--secret"]
+        self.master.run_command(cmd, stdin_text="{0}\n".format(
             self.client.config.admin_password))
         tasks.user_add(self.master, 'keycloakuser',
                        extra_args=["--user-auth-type=idp",
@@ -1068,7 +1097,7 @@ class TestIDPKeycloak(TestIDP):
             ["ipa", "user-find", "--idp-user-id=testuser1@ipa.test", "--all"]
         )
         assert "keycloakidp" in list_by_user.stdout_text
-        tasks.clear_sssd_cache(self.master)
+        self.prepare_idp_kinit_host(self.master, 'keycloakuser')
         self.kinit_idp(self.master, 'keycloakuser', keycloak_server=self.client)
 
     @pytest.fixture
@@ -1099,6 +1128,7 @@ class TestIDPKeycloak(TestIDP):
         Test case to check that hbacrule is working as
         expected for user configured with external idp.
         """
+        self.prepare_idp_kinit_host(self.master, 'keycloakuser')
         self.kinit_idp(self.master, 'keycloakuser', keycloak_server=self.client)
         ssh_cmd = "ssh -q -K -l keycloakuser {0} whoami"
         valid_ssh = self.master.run_command(
@@ -1135,8 +1165,7 @@ class TestIDPKeycloak(TestIDP):
         ]
         for cmd in cmdlist:
             self.master.run_command(cmd)
-        tasks.clear_sssd_cache(self.master)
-        tasks.clear_sssd_cache(self.client)
+        self.prepare_idp_kinit_host(self.client, 'keycloakuser')
         try:
             cmd = 'sudo -ll -U keycloakuser'
             test = self.client.run_command(cmd).stdout_text
@@ -1173,6 +1202,7 @@ class TestIDPKeycloak(TestIDP):
             ["ipa", "user-find", "--idp-user-id=testuser1@ipa.test", "--all"]
         )
         assert "keycloakidp" in list_by_user.stdout_text
+        self.prepare_idp_kinit_host(self.replica, 'keycloakuser')
         self.kinit_idp(self.replica, 'keycloakuser', keycloak_server=self.client)
 
     def test_idp_with_services(self):
@@ -1209,8 +1239,9 @@ class TestIDPKeycloak(TestIDP):
         user = "backupuser"
         cmd = ["ipa", "idp-add", "testidp", "--provider=keycloak",
                "--client-id=ipa_oidc_client", "--org=master",
-               "--base-url={0}:8443".format(self.client.hostname)]
-        self.master.run_command(cmd, stdin_text="{0}\n{0}".format(
+               "--base-url={0}:8443".format(self.client.hostname),
+               "--secret"]
+        self.master.run_command(cmd, stdin_text="{0}\n".format(
             self.client.config.admin_password))
 
         tasks.user_add(self.master, user,
@@ -1236,6 +1267,7 @@ class TestIDPKeycloak(TestIDP):
                     "testuser1@ipa.test") in list_user
             list_idp = self.master.run_command(['ipa', 'idp-find', 'testidp'])
             assert "testidp" in list_idp.stdout_text
+            self.prepare_idp_kinit_host(self.master, user)
             self.kinit_idp(self.master, user, keycloak_server=self.client)
         finally:
             tasks.kdestroy_all(self.master)
@@ -1332,18 +1364,8 @@ class TestIDPKeycloak(TestIDP):
             )
             test_idp = self.master.run_command(["klist", "-C"])
             assert "152" in test_idp.stdout_text
-            journal = self.master.run_command(
-                ["journalctl", "-u", "ipa-otpd", "--since=%s" % since],
-                raiseonerr=False,
-            )
-            text = (journal.stdout_text + journal.stderr_text).lower()
-            jwt_markers = (
-                "client_assertion",
-                "private_key_jwt",
-                "jwt-bearer",
-                "client-assertion-type",
-            )
-            assert any(marker in text for marker in jwt_markers)
+            text = idp_oauth_journal_text(self.master, since)
+            assert "oidc_child finished successfully" in text
         finally:
             if kc_client_added:
                 keycloak_delete_client(self.client, self.KEYCLOAK_JWT_CLIENT_ID)
@@ -1456,9 +1478,7 @@ class TestIDPKeycloak(TestIDP):
                 ],
             )
             tls_user_added = True
-            tasks.clear_sssd_cache(self.master)
-            tasks.wait_for_sssd_domain_status_online(self.master)
-            wait_for_ipa_user_lookup_id(self.master, self.KEYCLOAK_TLS_USER)
+            self.prepare_idp_kinit_host(self.master, self.KEYCLOAK_TLS_USER)
             self._kinit_idp_keycloak_mtls(
                 self.master, self.KEYCLOAK_TLS_USER)
         finally:
@@ -1996,18 +2016,8 @@ class TestIDPAzure(TestIDP):
             )
             test_idp = self.client.run_command(["klist", "-C"])
             assert "152" in test_idp.stdout_text
-            journal = self.master.run_command(
-                ["journalctl", "-u", "ipa-otpd", "--since=%s" % since],
-                raiseonerr=False,
-            )
-            text = (journal.stdout_text + journal.stderr_text).lower()
-            jwt_markers = (
-                "client_assertion",
-                "private_key_jwt",
-                "jwt-bearer",
-                "client-assertion-type",
-            )
-            assert any(marker in text for marker in jwt_markers)
+            text = idp_oauth_journal_text(self.master, since)
+            assert "oidc_child finished successfully" in text
         finally:
             self._entra_delete_uploaded_certs(
                 app_object_id, pem_bytes, token=token)
@@ -2215,8 +2225,9 @@ class TestIDPAzure(TestIDP):
                     "--client-auth-method=private_key_jwt",
                     "--client-cert-p12-file=%s"
                     % IDP_CLIENT_P12_NOPASS_IPA_PATH,
+                    "--secret",
                 ],
-                stdin_text="\n\n",
+                stdin_text=p12_passphrase_stdin(""),
             )
             show_out = self.master.run_command(
                 ["ipa", "idp-show", self.AZURE_NOPASS_IDP_NAME, "--all"])
@@ -2230,6 +2241,7 @@ class TestIDPAzure(TestIDP):
                 "azurenopass",
                 "UserNopass",
             )
+            self.prepare_idp_kinit_host(self.client, self.AZURE_NOPASS_IPA_USERNAME)
             self._azure_device_kinit(self.AZURE_NOPASS_IPA_USERNAME)
         finally:
             self._entra_delete_uploaded_certs(
@@ -3284,9 +3296,9 @@ class TestIDPAzure(TestIDP):
             show = self.master.run_command(
                 ["ipa", "idp-show", idp_name, "--all"])
             assert "private_key_jwt" in show.stdout_text.lower()
-            tasks.clear_sssd_cache(self.master)
-            tasks.wait_for_sssd_domain_status_online(self.master)
-            wait_for_ipa_user_lookup_id(self.master, ipa_user)
+            tasks.clear_sssd_cache(self.client)
+            tasks.wait_for_sssd_domain_status_online(self.client)
+            wait_for_ipa_user_lookup_id(self.client, ipa_user)
             self._azure_device_kinit(ipa_user)
         finally:
             self._entra_delete_uploaded_certs(
