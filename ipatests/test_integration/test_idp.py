@@ -24,11 +24,42 @@ from ipatests.pytest_ipa.integration import tasks, create_keycloak
 # OAuth device flow: Keycloak prints "Authenticate at {url} ..."; Microsoft
 # Entra prints "Authenticate with PIN {user_code} at {url} ..." and the user
 # must submit {user_code} on the device login page before signing in.
+# Entra localizes {url} from the browser locale. Test hosts are often not
+# English (screenshots came back in Greek), so English aria-labels ("Code")
+# miss. Open that URL with en-US market/locale and an English Accept-Language.
 DEVICE_AUTH_PROMPT_RE = re.compile(
     r'Authenticate(?:\s+with\s+PIN\s+(\S+))?'
     r'\s+at\s+(.+?)\s+and\s+press\s+ENTER\.:',
     re.DOTALL,
 )
+
+
+def entra_verification_uri_english(uri):
+    """Return Entra *uri* so the device-login page renders in English.
+
+    ``kinit`` prints ``Authenticate with PIN {user_code} at {url}``. That
+    URL has no language, and login.microsoft.com follows the browser locale,
+    so screenshots from non-English hosts are not English. ``mkt=en-US`` is
+    the market culture, ``ui_locales=en-US`` is the OIDC UI locale, and
+    ``lc=1033`` is the en-US locale id the Microsoft login UI honors.
+    """
+    if not uri or not str(uri).strip():
+        return uri
+    parts = urllib.parse.urlsplit(str(uri).strip())
+    drop = ("mkt", "lc", "ui_locales")
+    query = [
+        (key, value)
+        for key, value in urllib.parse.parse_qsl(
+            parts.query, keep_blank_values=True)
+        if key.lower() not in drop
+    ]
+    query.extend((
+        ("mkt", "en-US"),
+        ("ui_locales", "en-US"),
+        ("lc", "1033"),
+    ))
+    return urllib.parse.urlunsplit(
+        parts._replace(query=urllib.parse.urlencode(query)))
 
 
 
@@ -44,33 +75,58 @@ def selenium_remote_finally(shot_path):
     ).strip().format(path=repr(shot_path))
 
 
-SELENIUM_REMOTE_HEAD = textwrap.dedent(
-    """
-    import os
-    from selenium import webdriver
-    from datetime import datetime
-    from packaging.version import parse as parse_version
-    from selenium.webdriver.firefox.options import Options
-    from selenium.webdriver.common.by import By
-    from selenium.webdriver.support.ui import WebDriverWait
-    from selenium.webdriver.support import expected_conditions as EC
-    import time
+def selenium_remote_head(english=False):
+    """Preamble for a remote Firefox Selenium script.
 
-    os.environ.setdefault("DISPLAY", ":99")
-    options = Options()
-    if parse_version(webdriver.__version__) < parse_version('4.10.0'):
-        options.headless = True
-        driver = webdriver.Firefox(
-            executable_path="/opt/geckodriver", options=options)
-    else:
-        options.add_argument('-headless')
-        service = webdriver.FirefoxService(
-            executable_path="/opt/geckodriver")
-        driver = webdriver.Firefox(options=options, service=service)
-    driver.set_page_load_timeout(90)
-
+    *english* forces the page language to en-US. Entra device login follows
+    ``Accept-Language`` and ``navigator.language``; ``privacy.spoof_english``
+    is Firefox's "request English versions of web pages" setting, so the
+    host locale cannot localize the screenshot.
     """
-).strip() + "\n\n"
+    lang_prefs = ""
+    if english:
+        lang_prefs = textwrap.dedent(
+            """
+            os.environ["LANG"] = "en_US.UTF-8"
+            os.environ["LANGUAGE"] = "en_US:en"
+            os.environ["LC_MESSAGES"] = "en_US.UTF-8"
+            options.set_preference("intl.accept_languages", "en-US, en")
+            options.set_preference("intl.locale.requested", "en-US")
+            options.set_preference("privacy.spoof_english", 2)
+            options.add_argument("-lang")
+            options.add_argument("en-US")
+            """
+        ).strip() + "\n"
+    return textwrap.dedent(
+        """
+        import os
+        from selenium import webdriver
+        from datetime import datetime
+        from packaging.version import parse as parse_version
+        from selenium.webdriver.firefox.options import Options
+        from selenium.webdriver.common.by import By
+        from selenium.webdriver.support.ui import WebDriverWait
+        from selenium.webdriver.support import expected_conditions as EC
+        import time
+
+        os.environ.setdefault("DISPLAY", ":99")
+        options = Options()
+        """
+    ).strip() + "\n" + lang_prefs + textwrap.dedent(
+        """
+        if parse_version(webdriver.__version__) < parse_version('4.10.0'):
+            options.headless = True
+            driver = webdriver.Firefox(
+                executable_path="/opt/geckodriver", options=options)
+        else:
+            options.add_argument('-headless')
+            service = webdriver.FirefoxService(
+                executable_path="/opt/geckodriver")
+            driver = webdriver.Firefox(options=options, service=service)
+        driver.set_page_load_timeout(90)
+
+        """
+    ).strip() + "\n\n"
 
 
 KEYCLOCK_USER_CODE_BODY = textwrap.dedent(
@@ -91,7 +147,7 @@ KEYCLOCK_USER_CODE_BODY = textwrap.dedent(
 ).strip()
 
 keyclock_user_code_script = (
-    SELENIUM_REMOTE_HEAD
+    selenium_remote_head()
     + KEYCLOCK_USER_CODE_BODY
     + "\n"
     + selenium_remote_finally("/var/log/httpd/screenshot-keyclock-%s.png")
@@ -168,7 +224,7 @@ AZUREUSER_CODE_BODY = textwrap.dedent(
 ).strip()
 
 azure_user_code_script = (
-    SELENIUM_REMOTE_HEAD
+    selenium_remote_head(english=True)
     + AZUREUSER_CODE_BODY
     + "\n"
     + selenium_remote_finally("/var/log/httpd/screenshot-azure-%s.png")
@@ -1561,6 +1617,158 @@ class TestIDPCLI(IntegrationTest):
         assert result.returncode == 1
         assert "ipa: ERROR: 'secret' is required" in result.stderr_text
 
+    def _idp_add_client_secret(self, name):
+        """Add a keycloak-template IdP using client_secret auth."""
+        tasks.kinit_admin(self.master)
+        self.master.run_command(
+            [
+                "ipa", "idp-add", name,
+                "--provider", "keycloak",
+                "--org", "myrealm",
+                "--base-url", "keycloak.example.com",
+                "--client-id", "ipa-client",
+                "--secret",
+            ],
+            stdin_text="Secret123\nSecret123\n",
+        )
+
+    def _idp_add_cert_auth(self, name, method, p12_path, p12_password):
+        """Add IdP with certificate client authentication."""
+        tasks.kinit_admin(self.master)
+        self.master.run_command(
+            [
+                "ipa", "idp-add", name,
+                "--provider", "keycloak",
+                "--org", "myrealm",
+                "--base-url", "keycloak.example.com",
+                "--client-id", "ipa-client",
+                "--client-auth-method", method,
+                "--client-cert-p12-file", p12_path,
+            ],
+            stdin_text="%s\n%s\n" % (p12_password, p12_password),
+        )
+
+    def _idp_del(self, name):
+        tasks.kinit_admin(self.master)
+        self.master.run_command(["ipa", "idp-del", name], raiseonerr=False)
+
+    def test_idp_mod_p12_on_client_secret_without_method_rejected(self):
+        """
+        L598-L610: ``idp-mod`` with PKCS#12 while method stays
+        ``client_secret`` must raise MutuallyExclusiveError (not a raw
+        LDAP ``userPKCS12;binary`` error).
+        """
+        idp_name = "cli-mod-secret-p12"
+        p12_path = "/root/ca-agent.p12"
+        try:
+            self._idp_add_client_secret(idp_name)
+            result = self.master.run_command(
+                [
+                    "ipa", "idp-mod", idp_name,
+                    "--client-cert-p12-file", p12_path,
+                ],
+                stdin_text="%s\n%s\n"
+                % (self.master.config.admin_password,
+                   self.master.config.admin_password),
+                raiseonerr=False,
+            )
+            assert result.returncode != 0
+            assert_idp_cli_error(
+                result.stderr_text,
+                IDP_CLI_MUTUALLY_EXCLUSIVE_P12,
+                "mutually exclusive",
+            )
+            assert "userpkcs12;binary" not in result.stderr_text.lower()
+            assert "not allowed" not in result.stderr_text.lower()
+        finally:
+            self._idp_del(idp_name)
+
+    @pytest.mark.parametrize(
+        "method", ["private_key_jwt", "tls_client_auth"])
+    def test_idp_mod_replace_p12_same_method(self, method):
+        """
+        L598-L610: replace PKCS#12 without changing ``--client-auth-method``.
+
+        Covers private_key_jwt and tls_client_auth (method unchanged branch).
+        """
+        idp_name = "cli-mod-rotate-%s" % method.replace("_", "-")
+        p12_v1 = "/root/ca-agent.p12"
+        p12_v2 = "/tmp/idp-cli-rotate-%s.p12" % method
+        workdir = None
+        try:
+            self._idp_add_cert_auth(
+                idp_name, method, p12_v1, self.master.config.admin_password)
+            show_v1 = self.master.run_command(
+                ["ipa", "idp-show", idp_name, "--all"])
+            assert method in show_v1.stdout_text.lower()
+
+            workdir = generate_idp_client_openssl_bundle(
+                self.master,
+                workdir="/tmp/idp-cli-openssl-%s" % method,
+            )
+            self.master.run_command(
+                ["cp", os.path.join(workdir, "idp-client.p12"), p12_v2])
+            self.master.run_command(["chmod", "600", p12_v2])
+
+            tasks.kinit_admin(self.master)
+            result = self.master.run_command(
+                [
+                    "ipa", "idp-mod", idp_name,
+                    "--client-cert-p12-file", p12_v2,
+                ],
+                stdin_text=p12_passphrase_stdin(),
+                raiseonerr=False,
+            )
+            assert result.returncode == 0, result.stderr_text
+            assert "userpkcs12;binary" not in result.stderr_text.lower()
+            assert "not allowed" not in result.stderr_text.lower()
+
+            show_v2 = self.master.run_command(
+                ["ipa", "idp-show", idp_name, "--all"])
+            assert method in show_v2.stdout_text.lower()
+            # Public certificate attribute should still be present
+            assert "certificate:" in show_v2.stdout_text.lower()
+        finally:
+            self._idp_del(idp_name)
+            self.master.run_command(["rm", "-f", p12_v2], raiseonerr=False)
+            if workdir:
+                self.master.run_command(
+                    ["rm", "-rf", workdir], raiseonerr=False)
+
+    def test_idp_mod_revert_cert_to_client_secret(self):
+        """
+        L598-L610: switching back to ``client_secret`` removes
+        ``ipaIdpClientAuth`` without objectClass remove errors.
+        """
+        idp_name = "cli-mod-revert-secret"
+        p12_path = "/root/ca-agent.p12"
+        try:
+            self._idp_add_cert_auth(
+                idp_name,
+                "private_key_jwt",
+                p12_path,
+                self.master.config.admin_password,
+            )
+            tasks.kinit_admin(self.master)
+            result = self.master.run_command(
+                [
+                    "ipa", "idp-mod", idp_name,
+                    "--client-auth-method=client_secret",
+                    "--secret",
+                ],
+                stdin_text="Secret123\nSecret123\n",
+                raiseonerr=False,
+            )
+            assert result.returncode == 0, result.stderr_text
+
+            show = self.master.run_command(
+                ["ipa", "idp-show", idp_name, "--all"])
+            out = show.stdout_text.lower()
+            assert "private_key_jwt" not in out
+            assert "tls_client_auth" not in out
+        finally:
+            self._idp_del(idp_name)
+
 
 class TestIDPAzure(TestIDP):
     """Microsoft Entra (Azure) IdP integration tests."""
@@ -1586,6 +1794,9 @@ class TestIDPAzure(TestIDP):
     @staticmethod
     def add_azure_user_code(host, verification_uri, username, password,
                             device_user_code=None):
+        # Prompt URL has no language. Force en-US; screenshots were following
+        # the host locale (Greek) instead of English.
+        verification_uri = entra_verification_uri_english(verification_uri)
         contents = azure_user_code_script.format(
             uri=verification_uri,
             username=username,
