@@ -1561,6 +1561,158 @@ class TestIDPCLI(IntegrationTest):
         assert result.returncode == 1
         assert "ipa: ERROR: 'secret' is required" in result.stderr_text
 
+    def _idp_add_client_secret(self, name):
+        """Add a keycloak-template IdP using client_secret auth."""
+        tasks.kinit_admin(self.master)
+        self.master.run_command(
+            [
+                "ipa", "idp-add", name,
+                "--provider", "keycloak",
+                "--org", "myrealm",
+                "--base-url", "keycloak.example.com",
+                "--client-id", "ipa-client",
+                "--secret",
+            ],
+            stdin_text="Secret123\nSecret123\n",
+        )
+
+    def _idp_add_cert_auth(self, name, method, p12_path, p12_password):
+        """Add IdP with certificate client authentication."""
+        tasks.kinit_admin(self.master)
+        self.master.run_command(
+            [
+                "ipa", "idp-add", name,
+                "--provider", "keycloak",
+                "--org", "myrealm",
+                "--base-url", "keycloak.example.com",
+                "--client-id", "ipa-client",
+                "--client-auth-method", method,
+                "--client-cert-p12-file", p12_path,
+            ],
+            stdin_text="%s\n%s\n" % (p12_password, p12_password),
+        )
+
+    def _idp_del(self, name):
+        tasks.kinit_admin(self.master)
+        self.master.run_command(["ipa", "idp-del", name], raiseonerr=False)
+
+    def test_idp_mod_p12_on_client_secret_without_method_rejected(self):
+        """
+        L598-L610: ``idp-mod`` with PKCS#12 while method stays
+        ``client_secret`` must raise MutuallyExclusiveError (not a raw
+        LDAP ``userPKCS12;binary`` error).
+        """
+        idp_name = "cli-mod-secret-p12"
+        p12_path = "/root/ca-agent.p12"
+        try:
+            self._idp_add_client_secret(idp_name)
+            result = self.master.run_command(
+                [
+                    "ipa", "idp-mod", idp_name,
+                    "--client-cert-p12-file", p12_path,
+                ],
+                stdin_text="%s\n%s\n"
+                % (self.master.config.admin_password,
+                   self.master.config.admin_password),
+                raiseonerr=False,
+            )
+            assert result.returncode != 0
+            assert_idp_cli_error(
+                result.stderr_text,
+                IDP_CLI_MUTUALLY_EXCLUSIVE_P12,
+                "mutually exclusive",
+            )
+            assert "userpkcs12;binary" not in result.stderr_text.lower()
+            assert "not allowed" not in result.stderr_text.lower()
+        finally:
+            self._idp_del(idp_name)
+
+    @pytest.mark.parametrize(
+        "method", ["private_key_jwt", "tls_client_auth"])
+    def test_idp_mod_replace_p12_same_method(self, method):
+        """
+        L598-L610: replace PKCS#12 without changing ``--client-auth-method``.
+
+        Covers private_key_jwt and tls_client_auth (method unchanged branch).
+        """
+        idp_name = "cli-mod-rotate-%s" % method.replace("_", "-")
+        p12_v1 = "/root/ca-agent.p12"
+        p12_v2 = "/tmp/idp-cli-rotate-%s.p12" % method
+        workdir = None
+        try:
+            self._idp_add_cert_auth(
+                idp_name, method, p12_v1, self.master.config.admin_password)
+            show_v1 = self.master.run_command(
+                ["ipa", "idp-show", idp_name, "--all"])
+            assert method in show_v1.stdout_text.lower()
+
+            workdir = generate_idp_client_openssl_bundle(
+                self.master,
+                workdir="/tmp/idp-cli-openssl-%s" % method,
+            )
+            self.master.run_command(
+                ["cp", os.path.join(workdir, "idp-client.p12"), p12_v2])
+            self.master.run_command(["chmod", "600", p12_v2])
+
+            tasks.kinit_admin(self.master)
+            result = self.master.run_command(
+                [
+                    "ipa", "idp-mod", idp_name,
+                    "--client-cert-p12-file", p12_v2,
+                ],
+                stdin_text=p12_passphrase_stdin(),
+                raiseonerr=False,
+            )
+            assert result.returncode == 0, result.stderr_text
+            assert "userpkcs12;binary" not in result.stderr_text.lower()
+            assert "not allowed" not in result.stderr_text.lower()
+
+            show_v2 = self.master.run_command(
+                ["ipa", "idp-show", idp_name, "--all"])
+            assert method in show_v2.stdout_text.lower()
+            # Public certificate attribute should still be present
+            assert "certificate:" in show_v2.stdout_text.lower()
+        finally:
+            self._idp_del(idp_name)
+            self.master.run_command(["rm", "-f", p12_v2], raiseonerr=False)
+            if workdir:
+                self.master.run_command(
+                    ["rm", "-rf", workdir], raiseonerr=False)
+
+    def test_idp_mod_revert_cert_to_client_secret(self):
+        """
+        L598-L610: switching back to ``client_secret`` removes
+        ``ipaIdpClientAuth`` without objectClass remove errors.
+        """
+        idp_name = "cli-mod-revert-secret"
+        p12_path = "/root/ca-agent.p12"
+        try:
+            self._idp_add_cert_auth(
+                idp_name,
+                "private_key_jwt",
+                p12_path,
+                self.master.config.admin_password,
+            )
+            tasks.kinit_admin(self.master)
+            result = self.master.run_command(
+                [
+                    "ipa", "idp-mod", idp_name,
+                    "--client-auth-method=client_secret",
+                    "--secret",
+                ],
+                stdin_text="Secret123\nSecret123\n",
+                raiseonerr=False,
+            )
+            assert result.returncode == 0, result.stderr_text
+
+            show = self.master.run_command(
+                ["ipa", "idp-show", idp_name, "--all"])
+            out = show.stdout_text.lower()
+            assert "private_key_jwt" not in out
+            assert "tls_client_auth" not in out
+        finally:
+            self._idp_del(idp_name)
+
 
 class TestIDPAzure(TestIDP):
     """Microsoft Entra (Azure) IdP integration tests."""
