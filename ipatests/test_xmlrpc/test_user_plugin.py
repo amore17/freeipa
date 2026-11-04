@@ -416,6 +416,26 @@ class TestUpdate(XMLRPC_test):
                 info='attribute "%s" not allowed' % attr)):
             command()
 
+    def test_smb_attrs_without_nt_objectclass(self, user):
+        """SMB attrs require ipaNTUserAttrs; option and setattr must agree."""
+        user.ensure_exists()
+        err = (
+            'Object class ipaNTUserAttrs is missing, '
+            'user entry cannot have SMB attributes.'
+        )
+        with raises_exact(errors.ValidationError(
+                name='ipantlogonscript', error=err)):
+            user.make_update_command(
+                updates=dict(ipantlogonscript=r'\\server\script.bat')
+            )()
+        with raises_exact(errors.ValidationError(
+                name='ipantlogonscript', error=err)):
+            user.make_update_command(
+                updates=dict(
+                    setattr=r'ipantlogonscript=\\server\script.bat'
+                )
+            )()
+
     def test_update(self, user):
         """ Update a user attribute """
         user.update(dict(givenname='Franta'))
