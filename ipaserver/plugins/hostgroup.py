@@ -281,7 +281,9 @@ class hostgroup_mod(LDAPUpdate):
     def pre_callback(self, ldap, dn, entry_attrs, attrs_list,
                      *keys, **options):
         assert isinstance(dn, DN)
-        if keys[0] in PROTECTED_HOSTGROUPS and 'rename' in options:
+        # --setattr cn= also renames; check entry_attrs like group_mod
+        if (keys[0] in PROTECTED_HOSTGROUPS
+                and ('rename' in options or 'cn' in entry_attrs)):
             raise errors.ProtectedEntryError(label=_('hostgroup'),
                                              key=keys[0],
                                              reason=_('privileged hostgroup'))

@@ -149,6 +149,16 @@ class TestHostGroup(XMLRPC_test):
                           key=ipaservers.cn, reason=reason)):
             command()
 
+    def test_rename_ipaservers_setattr(self, ipaservers):
+        """ Try to rename ipaservers via --setattr cn= """
+        command = ipaservers.make_command(
+            'hostgroup_mod', *[ipaservers.cn],
+            **dict(setattr='cn=%s' % renamedhostgroup1))
+        reason = 'privileged hostgroup'
+        with raises_exact(errors.ProtectedEntryError(label='hostgroup',
+                          key=ipaservers.cn, reason=reason)):
+            command()
+
     def test_create_host_add_to_hostgroup(self, hostgroup, host):
         """ Check that host can be added to hostgroup """
         host.create()
