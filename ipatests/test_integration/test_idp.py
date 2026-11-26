@@ -24,9 +24,9 @@ from ipatests.pytest_ipa.integration import tasks, create_keycloak
 # OAuth device flow: Keycloak prints "Authenticate at {url} ..."; Microsoft
 # Entra prints "Authenticate with PIN {user_code} at {url} ..." and the user
 # must submit {user_code} on the device login page before signing in.
-# Entra localizes {url} from the browser locale. Test hosts are often not
-# English (screenshots came back in Greek), so English aria-labels ("Code")
-# miss. Open that URL with en-US market/locale and an English Accept-Language.
+# Entra CSS uses local("Segoe UI") and "Segoe UI Symbol". Firefox on Linux
+# resolves that to a symbol font, so the English page and the ASCII email
+# are drawn with Greek glyphs. Ignore page fonts and keep the locale en-US.
 DEVICE_AUTH_PROMPT_RE = re.compile(
     r'Authenticate(?:\s+with\s+PIN\s+(\S+))?'
     r'\s+at\s+(.+?)\s+and\s+press\s+ENTER\.:',
@@ -34,18 +34,39 @@ DEVICE_AUTH_PROMPT_RE = re.compile(
 )
 
 
+# login.microsoft.com/device redirects and the next Entra documents are
+# chosen from Accept-Language. These hosts are rewritten to the deviceauth
+# page, which keeps mkt/lc and renders en-US even when the browser asks
+# for another language.
+_ENTRA_DEVICE_SHORT_HOSTS = (
+    "login.microsoft.com",
+    "www.login.microsoft.com",
+    "microsoft.com",
+    "www.microsoft.com",
+)
+_ENTRA_DEVICE_SHORT_PATHS = ("/device", "/devicelogin")
+
+
 def entra_verification_uri_english(uri):
     """Return Entra *uri* so the device-login page renders in English.
 
-    ``kinit`` prints ``Authenticate with PIN {user_code} at {url}``. That
-    URL has no language, and login.microsoft.com follows the browser locale,
-    so screenshots from non-English hosts are not English. ``mkt=en-US`` is
-    the market culture, ``ui_locales=en-US`` is the OIDC UI locale, and
-    ``lc=1033`` is the en-US locale id the Microsoft login UI honors.
+    ``kinit`` prints ``Authenticate with PIN {user_code} at {url}``. The
+    short device URL follows the host Accept-Language. Opening
+    ``/common/oauth2/deviceauth`` with ``mkt=en-US`` and ``lc=1033`` makes
+    Entra embed an en-US locale in the page itself.
     """
     if not uri or not str(uri).strip():
         return uri
     parts = urllib.parse.urlsplit(str(uri).strip())
+    host = (parts.hostname or "").lower()
+    path = (parts.path or "").rstrip("/") or "/"
+    if (host in _ENTRA_DEVICE_SHORT_HOSTS
+            and path in _ENTRA_DEVICE_SHORT_PATHS):
+        parts = parts._replace(
+            scheme="https",
+            netloc="login.microsoftonline.com",
+            path="/common/oauth2/deviceauth",
+        )
     drop = ("mkt", "lc", "ui_locales")
     query = [
         (key, value)
@@ -63,9 +84,42 @@ def entra_verification_uri_english(uri):
 
 
 
-def selenium_remote_finally(shot_path):
+# Applied in the remote script before the Azure screenshot. Entra's font
+# stack is a symbol font on Linux, so this forces a Unicode sans over the
+# glyphs that are already on the page, including open shadow roots.
+_FORCE_LATIN_FONT_JS = (
+    "function paint(node){"
+    "if(node.style&&node.style.setProperty){"
+    "node.style.setProperty("
+    "'font-family','sans-serif','important');"
+    "}"
+    "if(!node.querySelectorAll){return;}"
+    "var nodes=node.querySelectorAll('*');"
+    "for(var i=0;i<nodes.length;i++){"
+    "var el=nodes[i];"
+    "if(el.style&&el.style.setProperty){"
+    "el.style.setProperty("
+    "'font-family','sans-serif','important');"
+    "}"
+    "if(el.shadowRoot){paint(el.shadowRoot);}"
+    "}"
+    "}"
+    "var root=document.documentElement||document.body;"
+    "if(root){paint(root);root.offsetWidth;}"
+)
+
+
+def selenium_remote_finally(shot_path, force_latin_font=False):
     """Return try/finally tail for remote Selenium scripts."""
-    return textwrap.dedent(
+    font_fix = ""
+    if force_latin_font:
+        font_fix = (
+            "    try:\n"
+            "        driver.execute_script(%s)\n"
+            "    except Exception:\n"
+            "        pass\n" % repr(_FORCE_LATIN_FONT_JS)
+        )
+    tail = textwrap.dedent(
         """
         finally:
             now = datetime.now().strftime("%M-%S")
@@ -73,30 +127,262 @@ def selenium_remote_finally(shot_path):
             driver.quit()
         """
     ).strip().format(path=repr(shot_path))
+    return tail.replace(
+        "    now = datetime.now().strftime(\"%M-%S\")\n",
+        font_fix + "    now = datetime.now().strftime(\"%M-%S\")\n",
+        1,
+    )
+
+
+_ENTRA_ENGLISH_EXT_DIR = "/tmp/entra-english-ext"
+
+# Temporary Firefox extension. privacy.spoof_english is ignored unless
+# resistFingerprinting is on, and LC_ALL from the host overrides LANG.
+# This extension puts mkt/lc back on every login document, forces
+# Accept-Language, reports navigator.language as en-US, and replaces
+# Entra's symbol font with the generic sans.
+_ENTRA_ENGLISH_MANIFEST = """{
+  "manifest_version": 2,
+  "name": "entra-english",
+  "version": "1.0",
+  "permissions": [
+    "webRequest",
+    "webRequestBlocking",
+    "*://login.microsoftonline.com/*",
+    "*://login.microsoft.com/*",
+    "*://*.msftauth.net/*",
+    "*://*.msauth.net/*",
+    "*://*.msidentity.com/*"
+  ],
+  "background": {"scripts": ["background.js"]},
+  "content_scripts": [{
+    "matches": [
+      "*://login.microsoftonline.com/*",
+      "*://login.microsoft.com/*"
+    ],
+    "js": ["content.js"],
+    "run_at": "document_start",
+    "all_frames": true
+  }]
+}
+"""
+
+_ENTRA_ENGLISH_BACKGROUND = """\
+var nByTab = {};
+function loginHost(hostname) {
+  return hostname === "login.microsoftonline.com" ||
+    hostname === "login.microsoft.com";
+}
+browser.webRequest.onBeforeRequest.addListener(function (details) {
+  if (details.type !== "main_frame" || details.method !== "GET") {
+    return {};
+  }
+  var url;
+  try {
+    url = new URL(details.url);
+  } catch (e) {
+    return {};
+  }
+  if (!loginHost(url.hostname)) {
+    return {};
+  }
+  if (url.searchParams.get("mkt") === "en-US" &&
+      url.searchParams.get("lc") === "1033") {
+    return {};
+  }
+  var n = nByTab[details.tabId] || 0;
+  if (n >= 3) {
+    return {};
+  }
+  nByTab[details.tabId] = n + 1;
+  url.searchParams.set("mkt", "en-US");
+  url.searchParams.set("lc", "1033");
+  url.searchParams.set("ui_locales", "en-US");
+  return {redirectUrl: url.href};
+}, {
+  urls: [
+    "*://login.microsoftonline.com/*",
+    "*://login.microsoft.com/*"
+  ]
+}, ["blocking"]);
+browser.webRequest.onBeforeSendHeaders.addListener(function (details) {
+  var headers = (details.requestHeaders || []).filter(function (header) {
+    return header.name.toLowerCase() !== "accept-language";
+  });
+  headers.push({name: "Accept-Language", value: "en-US,en;q=0.9"});
+  return {requestHeaders: headers};
+}, {
+  urls: [
+    "*://login.microsoftonline.com/*",
+    "*://login.microsoft.com/*",
+    "*://*.msftauth.net/*",
+    "*://*.msauth.net/*",
+    "*://*.msidentity.com/*"
+  ]
+}, ["blocking", "requestHeaders"]);
+"""
+
+_ENTRA_ENGLISH_CONTENT = """\
+(function () {
+  var lang = "en-US";
+  var langs = Object.freeze(["en-US", "en"]);
+  function lock(obj, prop, get) {
+    try {
+      Object.defineProperty(obj, prop, {configurable: true, get: get});
+    } catch (e) {}
+  }
+  lock(Navigator.prototype, "language", function () { return lang; });
+  lock(Navigator.prototype, "languages", function () { return langs; });
+  var css = "*{font-family:sans-serif !important}";
+  function paint() {
+    var root = document.documentElement;
+    if (!root || document.getElementById("entra-latin")) {
+      return;
+    }
+    var style = document.createElement("style");
+    style.id = "entra-latin";
+    style.textContent = css;
+    root.appendChild(style);
+  }
+  try {
+    paint();
+    new MutationObserver(paint).observe(
+      document, {childList: true, subtree: true});
+  } catch (e) {}
+})();
+"""
+
+
+# Fedora fontconfig resolves Entra's local("Segoe UI") / "Segoe UI Symbol"
+# stack to a symbol font. Alias those families at the user sans, and drop
+# the symbol faces that draw Latin letters as Greek.
+_ENTRA_FONTCONFIG = """\
+<?xml version="1.0"?>
+<fontconfig>
+  <selectfont>
+    <rejectfont>
+      <pattern>
+        <patelt name="family">
+          <string>Standard Symbols PS</string>
+        </patelt>
+      </pattern>
+      <pattern>
+        <patelt name="family">
+          <string>Standard Symbols L</string>
+        </patelt>
+      </pattern>
+      <pattern>
+        <patelt name="family">
+          <string>Symbol</string>
+        </patelt>
+      </pattern>
+    </rejectfont>
+  </selectfont>
+  <alias binding="strong">
+    <family>Segoe UI</family>
+    <prefer><family>sans-serif</family></prefer>
+  </alias>
+  <alias binding="strong">
+    <family>Segoe UI Webfont</family>
+    <prefer><family>sans-serif</family></prefer>
+  </alias>
+  <alias binding="strong">
+    <family>Segoe UI Symbol</family>
+    <prefer><family>sans-serif</family></prefer>
+  </alias>
+  <alias binding="strong">
+    <family>Segoe Xbox Symbol</family>
+    <prefer><family>sans-serif</family></prefer>
+  </alias>
+  <alias binding="strong">
+    <family>Segoe UI Light</family>
+    <prefer><family>sans-serif</family></prefer>
+  </alias>
+  <alias binding="strong">
+    <family>Segoe UI Semibold</family>
+    <prefer><family>sans-serif</family></prefer>
+  </alias>
+  <alias binding="strong">
+    <family>Segoe UI Semilight</family>
+    <prefer><family>sans-serif</family></prefer>
+  </alias>
+  <alias binding="strong">
+    <family>Segoe UI Bold</family>
+    <prefer><family>sans-serif</family></prefer>
+  </alias>
+  <alias binding="strong">
+    <family>Segoe UI Italic</family>
+    <prefer><family>sans-serif</family></prefer>
+  </alias>
+  <alias binding="strong">
+    <family>Segoe UI Bold Italic</family>
+    <prefer><family>sans-serif</family></prefer>
+  </alias>
+</fontconfig>
+"""
+
+
+def _remote_fontconfig_lines():
+    """Remote statements that alias Entra's fonts to the system sans."""
+    return (
+        "_fc_dir = os.path.join(\n"
+        "    os.environ.get('HOME', '/root'),\n"
+        "    '.config', 'fontconfig', 'conf.d')\n"
+        "os.makedirs(_fc_dir, exist_ok=True)\n"
+        "_fc_file = os.path.join(_fc_dir, '99-entra-latin.conf')\n"
+        "open(_fc_file, 'w').write(%s)\n" % repr(_ENTRA_FONTCONFIG)
+    )
+
+
+def _remote_write_lines(directory, files):
+    """Python statements that write *files* under *directory* on the host."""
+    lines = ["os.makedirs(%s, exist_ok=True)\n" % repr(directory)]
+    for name, text in files:
+        path = directory.rstrip("/") + "/" + name
+        lines.append("open(%s, 'w').write(%s)\n" % (repr(path), repr(text)))
+    return "".join(lines)
 
 
 def selenium_remote_head(english=False):
     """Preamble for a remote Firefox Selenium script.
 
-    *english* forces the page language to en-US. Entra device login follows
-    ``Accept-Language`` and ``navigator.language``; ``privacy.spoof_english``
-    is Firefox's "request English versions of web pages" setting, so the
-    host locale cannot localize the screenshot.
+    *english* launches Firefox under ``LC_ALL=en_US.UTF-8``, ignores the
+    page font, and installs a temporary extension that keeps Entra login
+    documents on en-US. Entra's ``local("Segoe UI")`` face is a symbol font
+    on Linux, so the English strings render as Greek until page fonts are
+    turned off.
     """
-    lang_prefs = ""
+    before_options = ""
+    after_options = ""
+    after_driver = ""
     if english:
-        lang_prefs = textwrap.dedent(
-            """
-            os.environ["LANG"] = "en_US.UTF-8"
-            os.environ["LANGUAGE"] = "en_US:en"
-            os.environ["LC_MESSAGES"] = "en_US.UTF-8"
-            options.set_preference("intl.accept_languages", "en-US, en")
-            options.set_preference("intl.locale.requested", "en-US")
-            options.set_preference("privacy.spoof_english", 2)
-            options.add_argument("-lang")
-            options.add_argument("en-US")
-            """
-        ).strip() + "\n"
+        before_options = (
+            "os.environ['LC_ALL'] = 'en_US.UTF-8'\n"
+            "os.environ['LANG'] = 'en_US.UTF-8'\n"
+            "os.environ['LANGUAGE'] = 'en_US:en'\n"
+            "for _lc in list(os.environ):\n"
+            "    if _lc.startswith('LC_') and _lc != 'LC_ALL':\n"
+            "        os.environ.pop(_lc, None)\n"
+            + _remote_fontconfig_lines()
+            + _remote_write_lines(_ENTRA_ENGLISH_EXT_DIR, (
+                ("manifest.json", _ENTRA_ENGLISH_MANIFEST),
+                ("background.js", _ENTRA_ENGLISH_BACKGROUND),
+                ("content.js", _ENTRA_ENGLISH_CONTENT),
+            ))
+        )
+        after_options = (
+            'options.set_preference("intl.accept_languages", "en-US, en")\n'
+            'options.set_preference("intl.locale.requested", "en-US")\n'
+            'options.set_preference("intl.locale.matchOS", False)\n'
+            'options.set_preference('
+            '"browser.display.use_document_fonts", 0)\n'
+        )
+        after_driver = (
+            "try:\n"
+            "    driver.install_addon(%s, temporary=True)\n"
+            "except Exception:\n"
+            "    pass\n" % repr(_ENTRA_ENGLISH_EXT_DIR)
+        )
     return textwrap.dedent(
         """
         import os
@@ -110,9 +396,10 @@ def selenium_remote_head(english=False):
         import time
 
         os.environ.setdefault("DISPLAY", ":99")
-        options = Options()
         """
-    ).strip() + "\n" + lang_prefs + textwrap.dedent(
+    ).strip() + "\n" + before_options + "options = Options()\n" + (
+        after_options
+    ) + textwrap.dedent(
         """
         if parse_version(webdriver.__version__) < parse_version('4.10.0'):
             options.headless = True
@@ -126,7 +413,7 @@ def selenium_remote_head(english=False):
         driver.set_page_load_timeout(90)
 
         """
-    ).strip() + "\n\n"
+    ).strip() + "\n" + after_driver + "\n"
 
 
 KEYCLOCK_USER_CODE_BODY = textwrap.dedent(
@@ -223,12 +510,27 @@ AZUREUSER_CODE_BODY = textwrap.dedent(
     """
 ).strip()
 
-azure_user_code_script = (
-    selenium_remote_head(english=True)
-    + AZUREUSER_CODE_BODY
-    + "\n"
-    + selenium_remote_finally("/var/log/httpd/screenshot-azure-%s.png")
-)
+def azure_user_code_script_for(uri, username, password, device_user_code):
+    """Remote Selenium script. Format only the body; the head contains ``{``.
+
+    The English-browser preamble embeds a WebExtension. Running ``str.format``
+    on that text would treat the extension source as format fields.
+    """
+    body = AZUREUSER_CODE_BODY.format(
+        uri=uri,
+        username=username,
+        password=password,
+        device_user_code=device_user_code or "",
+    )
+    return (
+        selenium_remote_head(english=True)
+        + body
+        + "\n"
+        + selenium_remote_finally(
+            "/var/log/httpd/screenshot-azure-%s.png",
+            force_latin_font=True,
+        )
+    )
 
 
 
@@ -512,6 +814,40 @@ def azure_acquire_graph_token(tenant_id, client_id, client_secret):
     if "access_token" not in payload:
         raise RuntimeError("Azure token response missing access_token: %r" % payload)
     return payload["access_token"]
+
+
+def azure_set_preferred_language_english(config, user_principal):
+    """Best-effort Graph update: Entra user ``preferredLanguage=en-US``.
+
+    After the account is identified, the sign-in page can switch to that
+    user's language and ignore the browser. A missing Graph permission
+    does not fail the test; the browser still requests English.
+    """
+    names = (
+        "azure_tenant_id",
+        "azure_admin_client_id",
+        "azure_admin_client_secret",
+    )
+    if config is None or not user_principal:
+        return
+    if any(getattr(config, name, None) is None for name in names):
+        return
+    try:
+        token = azure_acquire_graph_token(
+            config.azure_tenant_id,
+            config.azure_admin_client_id,
+            config.azure_admin_client_secret,
+        )
+        user = urllib.parse.quote(str(user_principal), safe="")
+        url = "https://graph.microsoft.com/v1.0/users/%s" % user
+        body = json.dumps({"preferredLanguage": "en-US"}).encode("utf-8")
+        req = urllib.request.Request(url, data=body, method="PATCH")
+        req.add_header("Authorization", "Bearer %s" % token)
+        req.add_header("Content-Type", "application/json")
+        with urllib.request.urlopen(req, timeout=60):
+            pass
+    except Exception:
+        return
 
 
 def azure_graph_application_object_id(access_token, app_id):
@@ -1071,6 +1407,8 @@ class TestIDP(IntegrationTest):
                     TestIDPKeycloak.add_keycloak_user_code(
                         keycloak_server, uri)
                 else:
+                    azure_set_preferred_language_english(
+                        getattr(host, "config", None), azure_email)
                     TestIDPAzure.add_azure_user_code(
                         host, uri, azure_email, azure_password,
                         device_user_code=device_user_code,
@@ -1794,15 +2132,10 @@ class TestIDPAzure(TestIDP):
     @staticmethod
     def add_azure_user_code(host, verification_uri, username, password,
                             device_user_code=None):
-        # Prompt URL has no language. Force en-US; screenshots were following
-        # the host locale (Greek) instead of English.
+        # Prompt URL has no language. Open the deviceauth page in en-US.
         verification_uri = entra_verification_uri_english(verification_uri)
-        contents = azure_user_code_script.format(
-            uri=verification_uri,
-            username=username,
-            password=password,
-            device_user_code=device_user_code or "",
-        )
+        contents = azure_user_code_script_for(
+            verification_uri, username, password, device_user_code)
         TestIDP.run_remote_selenium(
             host, contents, "add_azure_user_code.py", timeout=180)
 
