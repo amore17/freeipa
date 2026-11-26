@@ -497,16 +497,51 @@ AZUREUSER_CODE_BODY = textwrap.dedent(
             EC.element_to_be_clickable((By.NAME, "passwd")))
         driver.find_element(By.NAME, "passwd").send_keys("{password}")
         driver.find_element(By.ID, "idSIButton9").click()
-        # Handle remaining prompts (consent / stay signed in)
-        for _ in range(3):
+        # Login HTML includes every string, including "Approve sign-in",
+        # while the card is still the blank Microsoft shell. Only a
+        # displayed title is the Authenticator prompt. Wait on that
+        # title so a phone approval can finish before kinit verifies.
+        deadline = time.time() + 90
+        while time.time() < deadline:
+            approve = ""
             try:
-                btn = WebDriverWait(driver, 15).until(
-                    EC.element_to_be_clickable((By.ID, "idSIButton9")))
-                btn.click()
-                time.sleep(2)
+                el = driver.find_element(By.ID, "idDiv_SAOTCAS_Title")
+                if el.is_displayed():
+                    approve = (el.text or "").lower()
             except Exception:
+                approve = ""
+            if "approve" in approve:
+                try:
+                    other = driver.find_element(By.ID, "signInAnotherWay")
+                    if other.is_displayed() and other.is_enabled():
+                        other.click()
+                        time.sleep(2)
+                        continue
+                except Exception:
+                    pass
+                time.sleep(2)
+                continue
+            card = ""
+            try:
+                box = driver.find_element(By.ID, "lightbox")
+                if box.is_displayed():
+                    card = (box.text or "").lower()
+            except Exception:
+                card = ""
+            if ("you have signed in" in card
+                    or "signed in to the" in card):
                 break
-        time.sleep(2)
+            clicked = False
+            try:
+                btn = driver.find_element(By.ID, "idSIButton9")
+                if btn.is_displayed() and btn.is_enabled():
+                    btn.click()
+                    clicked = True
+                    time.sleep(2)
+            except Exception:
+                clicked = False
+            if not clicked:
+                time.sleep(1)
     """
 ).strip()
 
